@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import json
+from datetime import datetime, timezone
 
 app = FastAPI(title="PolySignal API", version="1.0")
 
@@ -33,10 +34,12 @@ def get_markets():
         r = requests.get(f"{GAMMA}/markets", params={
             "active": True,
             "closed": False,
-            "limit": 50,
+            "limit": 100,
         }, timeout=10)
         data = r.json()
+        now = datetime.now(timezone.utc)
         markets = []
+
         for m in data:
             try:
                 outcomes = json.loads(m.get("outcomes", "[]"))
@@ -55,7 +58,20 @@ def get_markets():
                 elif str(outcome).upper() == "NO":
                     no_price = price
 
-            if yes_price is None and no_price is None:
+            if yes_price is None or no_price is None:
+                continue
+
+            # Filtro 1: só mercados com end_date no futuro
+            end_date_str = m.get("endDate", "")
+            try:
+                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                if end_date < now:
+                    continue
+            except Exception:
+                continue
+
+            # Filtro 2: preço entre 5% e 95% (mercados vivos)
+            if yes_price < 5 or yes_price > 95:
                 continue
 
             markets.append({
@@ -64,8 +80,15 @@ def get_markets():
                 "yes_price": yes_price,
                 "no_price": no_price,
                 "volume": round(float(m.get("volume", 0) or 0), 2),
-                "end_date": m.get("endDate", ""),
+                "volume_24h": round(float(m.get("volume24hr", 0) or 0), 2),
+                "end_date": end_date_str,
+                "last_trade": m.get("lastTradePrice", None),
+                "change_24h": m.get("oneDayPriceChange", None),
             })
+
+        # Ordena por volume 24h decrescente
+        markets.sort(key=lambda x: x["volume_24h"], reverse=True)
         return markets
+
     except Exception as e:
         return {"error": str(e)}
