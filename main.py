@@ -92,3 +92,83 @@ def get_markets():
 
     except Exception as e:
         return {"error": str(e)}
+    
+@app.get("/signals")
+def get_signals():
+    try:
+        r = requests.get(f"{GAMMA}/markets", params={
+            "active": True,
+            "closed": False,
+            "limit": 100,
+        }, timeout=10)
+        data = r.json()
+        now = datetime.now(timezone.utc)
+        signals = []
+
+        for m in data:
+            try:
+                outcomes = json.loads(m.get("outcomes", "[]"))
+                prices = json.loads(m.get("outcomePrices", "[]"))
+            except Exception:
+                continue
+
+            yes_price = no_price = None
+            for i, outcome in enumerate(outcomes):
+                try:
+                    price = round(float(prices[i]) * 100, 1)
+                except Exception:
+                    price = None
+                if str(outcome).upper() == "YES":
+                    yes_price = price
+                elif str(outcome).upper() == "NO":
+                    no_price = price
+
+            if yes_price is None or no_price is None:
+                continue
+            if yes_price < 5 or yes_price > 95:
+                continue
+
+            end_date_str = m.get("endDate", "")
+            try:
+                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                if end_date < now:
+                    continue
+            except Exception:
+                continue
+
+            change = m.get("oneDayPriceChange", None)
+            volume_24h = float(m.get("volume24hr", 0) or 0)
+
+            if change is None:
+                continue
+            if abs(change) < 0.03:
+                continue
+            if volume_24h < 1000:
+                continue
+
+            sinal = "BUY" if change > 0 else "SELL"
+            confianca = min(round(abs(change) * 200, 0), 95)
+
+            # Kelly simples
+            p = yes_price / 100 if sinal == "BUY" else no_price / 100
+            edge = abs(change)
+            kelly = round((edge / (1 - p)) * 0.25 * 100, 1)
+            kelly = min(kelly, 5.0)
+
+            signals.append({
+                "question": m.get("question", ""),
+                "slug": m.get("slug", ""),
+                "sinal": sinal,
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "change_24h": round(change * 100, 2),
+                "confianca": confianca,
+                "kelly_pct": kelly,
+                "volume_24h": round(volume_24h, 2),
+            })
+
+        signals.sort(key=lambda x: abs(x["change_24h"]), reverse=True)
+        return signals
+
+    except Exception as e:
+        return {"error": str(e)}    
