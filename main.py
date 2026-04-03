@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
+import json
 
 app = FastAPI(title="PolySignal API", version="1.0")
 
@@ -37,23 +38,29 @@ def get_markets():
         data = r.json()
         markets = []
         for m in data:
-            outcome_prices = m.get("outcomePrices", [])
-            outcomes = m.get("outcomes", [])
+            try:
+                outcomes = json.loads(m.get("outcomes", "[]"))
+                prices = json.loads(m.get("outcomePrices", "[]"))
+            except Exception:
+                continue
+
             yes_price = no_price = None
             for i, outcome in enumerate(outcomes):
                 try:
-                    price = round(float(outcome_prices[i]) * 100, 1)
+                    price = round(float(prices[i]) * 100, 1)
                 except Exception:
                     price = None
                 if str(outcome).upper() == "YES":
                     yes_price = price
                 elif str(outcome).upper() == "NO":
                     no_price = price
+
             if yes_price is None and no_price is None:
                 continue
+
             markets.append({
                 "question": m.get("question", ""),
-                "slug": m.get("marketSlug", ""),
+                "slug": m.get("slug", ""),
                 "yes_price": yes_price,
                 "no_price": no_price,
                 "volume": round(float(m.get("volume", 0) or 0), 2),
