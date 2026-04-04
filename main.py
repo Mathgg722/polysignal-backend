@@ -161,7 +161,7 @@ def get_signals():
 def get_kalshi():
     try:
         r = requests.get(
-            "https://api.elections.kalshi.com/trade-api/v2/markets",
+            "https://api.kalshi.com/trade-api/v2/markets",
             params={"limit": 200, "status": "open"},
             timeout=10
         )
@@ -190,5 +190,4 @@ def get_kalshi():
         return markets
     except Exception as e:
         return {"error": str(e)}    
-    
     
