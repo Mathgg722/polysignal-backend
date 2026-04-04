@@ -1,10 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, text
+from sqlalchemy.orm import declarative_base, sessionmaker
 import requests
 import json
+import os
+import threading
+import time
 from datetime import datetime, timezone
 
-app = FastAPI(title="PolySignal API", version="1.0")
+app = FastAPI(title="PolySignal API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,8 +18,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── PostgreSQL ──────────────────────────────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+engine = None
+Session = None
+Base = declarative_base()
+
+class Snapshot(Base):
+    __tablename__ = "snapshots"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    slug = Column(String, index=True)
+    question = Column(String)
+    yes_price = Column(Float)
+    no_price = Column(Float)
+    volume = Column(Float)
+    volume_24h = Column(Float)
+    change_24h = Column(Float)
+    captured_at = Column(DateTime, default=datetime.utcnow)
+
+if DATABASE_URL:
+    try:
+        engine = create_engine(DATABASE_URL)
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        print("✅ PostgreSQL conectado")
+    except Exception as e:
+        print(f"❌ PostgreSQL erro: {e}")
+
+# ── Estado global ───────────────────────────────────────────
+state = {
+    "total_markets": 0,
+    "total_snapshots": 0,
+    "last_collection": None,
+    "worker_healthy": False,
+}
+
 GAMMA = "https://gamma-api.polymarket.com"
 
+# ── Coleta ──────────────────────────────────────────────────
 def fetch_all_markets():
     all_markets = []
     offset = 0
@@ -71,6 +112,13 @@ def parse_market(m, now):
     except Exception:
         return None
 
+    change = m.get("oneDayPriceChange", None)
+    if change is not None:
+        try:
+            change = float(change)
+        except Exception:
+            change = None
+
     return {
         "question": m.get("question", ""),
         "slug": m.get("slug", ""),
@@ -79,21 +127,68 @@ def parse_market(m, now):
         "volume": round(float(m.get("volume", 0) or 0), 2),
         "volume_24h": round(float(m.get("volume24hr", 0) or 0), 2),
         "end_date": end_date_str,
-        "last_trade": m.get("lastTradePrice", None),
-        "change_24h": m.get("oneDayPriceChange", None),
+        "change_24h": change,
     }
 
+def save_snapshots(markets):
+    if not Session:
+        return
+    try:
+        session = Session()
+        for m in markets:
+            snap = Snapshot(
+                slug=m["slug"],
+                question=m["question"],
+                yes_price=m["yes_price"],
+                no_price=m["no_price"],
+                volume=m["volume"],
+                volume_24h=m["volume_24h"],
+                change_24h=m["change_24h"],
+                captured_at=datetime.utcnow(),
+            )
+            session.add(snap)
+        session.commit()
+        result = session.execute(text("SELECT COUNT(*) FROM snapshots")).scalar()
+        state["total_snapshots"] = result
+        session.close()
+    except Exception as e:
+        print(f"❌ Snapshot erro: {e}")
+
+# ── Worker ──────────────────────────────────────────────────
+def worker_loop():
+    print("🔄 Worker iniciado")
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            all_data = fetch_all_markets()
+            markets = [parse_market(m, now) for m in all_data]
+            markets = [m for m in markets if m]
+            state["total_markets"] = len(markets)
+            state["last_collection"] = datetime.utcnow().isoformat()
+            state["worker_healthy"] = True
+            save_snapshots(markets)
+            print(f"✅ {len(markets)} mercados coletados · {state['total_snapshots']} snapshots")
+        except Exception as e:
+            state["worker_healthy"] = False
+            print(f"❌ Worker erro: {e}")
+        time.sleep(60)
+
+threading.Thread(target=worker_loop, daemon=True).start()
+
+# ── Endpoints ────────────────────────────────────────────────
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "PolySignal", "version": "1.0"}
+    return {"status": "ok", "service": "PolySignal", "version": "2.0"}
 
 @app.get("/status")
 def status():
     return {
         "status": "online",
-        "total_markets": 0,
-        "total_snapshots": 0,
-        "worker_healthy": False,
+        "total_markets": state["total_markets"],
+        "total_snapshots": state["total_snapshots"],
+        "last_collection": state["last_collection"],
+        "worker_healthy": state["worker_healthy"],
+        "db_connected": Session is not None,
     }
 
 @app.get("/markets")
@@ -132,10 +227,10 @@ def get_signals():
             if volume_24h < 1000:
                 continue
 
-            sinal = "BUY" if change > 0 else "SELL"
-            confianca = min(round(abs(change) * 200, 0), 95)
+            signal = "BUY" if change > 0 else "SELL"
+            confidence = round(min(abs(change) * 200, 95) / 100, 2)
 
-            p = parsed["yes_price"] / 100 if sinal == "BUY" else parsed["no_price"] / 100
+            p = parsed["yes_price"] / 100 if signal == "BUY" else parsed["no_price"] / 100
             edge = abs(change)
             kelly = round((edge / max(1 - p, 0.01)) * 0.25 * 100, 1)
             kelly = min(kelly, 5.0)
@@ -143,12 +238,12 @@ def get_signals():
             signals.append({
                 "question": parsed["question"],
                 "slug": parsed["slug"],
-                "sinal": sinal,
+                "signal": signal,
                 "yes_price": parsed["yes_price"],
                 "no_price": parsed["no_price"],
                 "change_24h": round(change * 100, 2),
-                "confianca": confianca,
-                "kelly_pct": kelly,
+                "confidence": confidence,
+                "kelly": kelly,
                 "volume_24h": volume_24h,
             })
 
@@ -156,7 +251,7 @@ def get_signals():
         return signals
     except Exception as e:
         return {"error": str(e)}
-    
+
 @app.get("/kalshi")
 def get_kalshi():
     try:
@@ -189,5 +284,4 @@ def get_kalshi():
         markets.sort(key=lambda x: x["volume_24h"], reverse=True)
         return markets
     except Exception as e:
-        return {"error": str(e)}    
-    
+        return {"error": str(e)}
