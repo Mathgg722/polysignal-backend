@@ -34,7 +34,7 @@ def fetch_all_markets():
             if len(data) < limit:
                 break
             offset += limit
-            if offset > 3000:
+            if offset > 300:
                 break
         except Exception:
             break
