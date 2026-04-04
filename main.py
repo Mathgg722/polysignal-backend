@@ -156,3 +156,39 @@ def get_signals():
         return signals
     except Exception as e:
         return {"error": str(e)}
+    
+@app.get("/kalshi")
+def get_kalshi():
+    try:
+        r = requests.get(
+            "https://api.elections.kalshi.com/trade-api/v2/markets",
+            params={"limit": 200, "status": "open"},
+            timeout=10
+        )
+        data = r.json()
+        markets = []
+        for m in data.get("markets", []):
+            yes_price = m.get("yes_ask", None)
+            no_price = m.get("no_ask", None)
+            if yes_price is None or no_price is None:
+                continue
+            yes_price = round(yes_price, 1)
+            no_price = round(no_price, 1)
+            if yes_price < 5 or yes_price > 95:
+                continue
+            markets.append({
+                "question": m.get("title", ""),
+                "slug": m.get("ticker", ""),
+                "yes_price": yes_price,
+                "no_price": no_price,
+                "volume": round(float(m.get("volume", 0) or 0), 2),
+                "volume_24h": round(float(m.get("volume_24h", 0) or 0), 2),
+                "end_date": m.get("close_time", ""),
+                "platform": "kalshi",
+            })
+        markets.sort(key=lambda x: x["volume_24h"], reverse=True)
+        return markets
+    except Exception as e:
+        return {"error": str(e)}    
+    
+    
