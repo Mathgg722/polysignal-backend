@@ -308,9 +308,121 @@ def get_signals():
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/reversion")
+def get_reversion():
+    """Motor #3 — Reversao a Media: compara preco atual com media historica do banco"""
+    if not Session:
+        return {"error": "Banco nao conectado"}
+    try:
+        now = datetime.now(timezone.utc)
+        all_data = fetch_all_markets()
+
+        # Busca media historica de cada slug no banco
+        session = Session()
+        rows = session.execute(text("""
+            SELECT slug, 
+                   AVG(yes_price) as avg_yes,
+                   STDDEV(yes_price) as std_yes,
+                   COUNT(*) as total_snaps,
+                   MIN(yes_price) as min_yes,
+                   MAX(yes_price) as max_yes
+            FROM snapshots
+            GROUP BY slug
+            HAVING COUNT(*) >= 5
+        """)).fetchall()
+        session.close()
+
+        historico = {r[0]: {
+            "avg_yes": r[1],
+            "std_yes": r[2] or 0,
+            "total_snaps": r[3],
+            "min_yes": r[4],
+            "max_yes": r[5],
+        } for r in rows}
+
+        results = []
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if not parsed:
+                continue
+
+            slug = parsed["slug"]
+            if slug not in historico:
+                continue
+
+            h = historico[slug]
+            avg = h["avg_yes"]
+            std = h["std_yes"]
+            current = parsed["yes_price"]
+            snaps = h["total_snaps"]
+
+            if avg is None or std is None:
+                continue
+
+            # Desvio do preco atual em relacao a media historica
+            desvio = current - avg
+            desvio_pct = round((desvio / avg) * 100, 2) if avg > 0 else 0
+
+            # Z-score — quantos desvios padrao acima/abaixo da media
+            zscore = round(desvio / std, 2) if std > 1 else 0
+
+            # So mostra se desvio for relevante (>= 1 desvio padrao ou >= 3%)
+            if abs(desvio_pct) < 3 and abs(zscore) < 1:
+                continue
+
+            # Direcao da reversao esperada
+            if desvio > 0:
+                # Preco atual acima da media — espera queda
+                direcao = "SELL"
+                direcao_cor = "#ff453a"
+                interpretacao = f"Preco {desvio_pct:.1f}% acima da media historica — possivel reversao para baixo"
+                acao = f"Compre NO a {parsed['no_price']}%"
+            else:
+                # Preco atual abaixo da media — espera alta
+                direcao = "BUY"
+                direcao_cor = "#30d158"
+                interpretacao = f"Preco {abs(desvio_pct):.1f}% abaixo da media historica — possivel reversao para cima"
+                acao = f"Compre YES a {parsed['yes_price']}%"
+
+            # Score de reversao (0-100)
+            score = min(round(abs(zscore) * 25 + abs(desvio_pct) * 2, 1), 100)
+
+            # Forca do sinal
+            if score >= 60:
+                forca = "FORTE"
+            elif score >= 30:
+                forca = "MEDIA"
+            else:
+                forca = "FRACA"
+
+            results.append({
+                "question": parsed["question"],
+                "slug": slug,
+                "direcao": direcao,
+                "direcao_cor": direcao_cor,
+                "forca": forca,
+                "score": score,
+                "yes_price_atual": current,
+                "yes_price_media": round(avg, 1),
+                "yes_price_min": round(h["min_yes"], 1),
+                "yes_price_max": round(h["max_yes"], 1),
+                "desvio_pct": desvio_pct,
+                "zscore": zscore,
+                "total_snaps": snaps,
+                "interpretacao": interpretacao,
+                "acao": acao,
+                "volume_24h": parsed["volume_24h"],
+                "no_price": parsed["no_price"],
+            })
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:20]
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/orphans")
 def get_orphans():
-    """Motor #44 — Mercados Órfãos: volume < $50k, máxima ineficiência"""
+    """Motor #44 — Mercados Orfaos: volume < $50k, maxima ineficiencia"""
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
@@ -324,17 +436,14 @@ def get_orphans():
             volume = parsed["volume"]
             change = parsed["change_24h"]
 
-            # Órfão: volume total < $50k e volume 24h < $5k
             if volume > 50000:
                 continue
             if volume_24h > 5000:
                 continue
 
-            # Score de ineficiência — quanto menor o volume, maior o edge potencial
             ineficiencia = round(100 - (volume / 500), 1)
             ineficiencia = max(0, min(100, ineficiencia))
 
-            # Distância do 50% — mercados longe do meio têm mais opinião formada
             yes = parsed["yes_price"]
             distancia_50 = abs(yes - 50)
 
@@ -358,7 +467,7 @@ def get_orphans():
 
 @app.get("/narrative")
 def get_narrative():
-    """Narrative Drift Engine — detecta força e direção da narrativa de cada mercado"""
+    """Narrative Drift Engine — detecta forca e direcao da narrativa de cada mercado"""
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
@@ -376,25 +485,16 @@ def get_narrative():
 
             abs_change = abs(change)
             direction = "BULLISH" if change > 0 else "BEARISH"
-
-            # Momentum narrativo — velocidade da mudança de preço
             momentum = min(round(abs_change * 300, 1), 100)
-
-            # Convicção do mercado — distância do 50%
             yes = parsed["yes_price"]
             distancia_50 = abs(yes - 50)
             convicao = round(distancia_50 * 2, 1)
-
-            # Volume score — mercados com mais volume têm narrativa mais forte
             vol_score = min(round((volume_24h / 10000) * 10, 1), 30)
-
-            # Score final composto
             narrative_score = round((momentum * 0.5) + (convicao * 0.3) + (vol_score * 0.2), 1)
 
             if narrative_score < 15:
                 continue
 
-            # Classificação de força
             if narrative_score >= 65:
                 forca = "FORTE"
                 forca_color = "#30d158"
@@ -405,7 +505,6 @@ def get_narrative():
                 forca = "FRACA"
                 forca_color = "#ff453a"
 
-            # Interpretação estratégica
             if direction == "BULLISH" and forca == "FORTE":
                 interpretacao = "Narrativa bullish consolidada — momentum favorece YES"
             elif direction == "BEARISH" and forca == "FORTE":
