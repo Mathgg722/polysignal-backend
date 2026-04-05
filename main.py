@@ -308,6 +308,131 @@ def get_signals():
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/anomalies")
+def get_anomalies():
+    """Motor #2 — Anomalias: detecta comportamento anormal vs historico do banco"""
+    if not Session:
+        return {"error": "Banco nao conectado"}
+    try:
+        now = datetime.now(timezone.utc)
+        all_data = fetch_all_markets()
+
+        session = Session()
+        rows = session.execute(text("""
+            SELECT slug,
+                   AVG(yes_price) as avg_yes,
+                   STDDEV(yes_price) as std_yes,
+                   AVG(volume_24h) as avg_vol,
+                   STDDEV(volume_24h) as std_vol,
+                   COUNT(*) as total_snaps,
+                   MAX(captured_at) as last_snap
+            FROM snapshots
+            GROUP BY slug
+            HAVING COUNT(*) >= 10
+        """)).fetchall()
+        session.close()
+
+        historico = {r[0]: {
+            "avg_yes": r[1],
+            "std_yes": r[2] or 0,
+            "avg_vol": r[3] or 0,
+            "std_vol": r[4] or 0,
+            "total_snaps": r[5],
+            "last_snap": r[6],
+        } for r in rows}
+
+        results = []
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if not parsed:
+                continue
+
+            slug = parsed["slug"]
+            if slug not in historico:
+                continue
+
+            h = historico[slug]
+            avg_yes = h["avg_yes"]
+            std_yes = h["std_yes"]
+            avg_vol = h["avg_vol"]
+            std_vol = h["std_vol"]
+            current_yes = parsed["yes_price"]
+            current_vol = parsed["volume_24h"]
+
+            if avg_yes is None:
+                continue
+
+            # Anomalia de preco
+            preco_zscore = round((current_yes - avg_yes) / std_yes, 2) if std_yes > 0.5 else 0
+            preco_desvio = round(((current_yes - avg_yes) / avg_yes) * 100, 1) if avg_yes > 0 else 0
+
+            # Anomalia de volume
+            vol_zscore = round((current_vol - avg_vol) / std_vol, 2) if std_vol > 100 else 0
+
+            # Score de anomalia composto
+            # Intensidade (preco) 40% + Surpresa (volume) 30% + Confirmacao (ambos alinhados) 30%
+            intensidade = min(abs(preco_zscore) * 25, 40)
+            surpresa = min(abs(vol_zscore) * 15, 30)
+            confirmacao = 30 if (abs(preco_zscore) > 1 and abs(vol_zscore) > 1) else 0
+            anomaly_score = round(intensidade + surpresa + confirmacao, 1)
+
+            if anomaly_score < 15:
+                continue
+
+            # Tipo de anomalia
+            if preco_zscore > 1.5 and vol_zscore > 1:
+                tipo = "SPIKE BULLISH"
+                tipo_cor = "#30d158"
+                interpretacao = "Alta anormal com volume elevado — possivel noticia ou entrada de baleia"
+            elif preco_zscore < -1.5 and vol_zscore > 1:
+                tipo = "SPIKE BEARISH"
+                tipo_cor = "#ff453a"
+                interpretacao = "Queda anormal com volume elevado — possivel noticia negativa"
+            elif abs(preco_zscore) > 2:
+                tipo = "PRECO EXTREMO"
+                tipo_cor = "#ff9f0a"
+                interpretacao = "Preco muito distante da media historica — possivel mispricing"
+            elif vol_zscore > 2:
+                tipo = "VOLUME ANORMAL"
+                tipo_cor = "#bf5af2"
+                interpretacao = "Volume muito acima do normal — atividade suspeita ou evento relevante"
+            else:
+                tipo = "ANOMALIA"
+                tipo_cor = "#0a84ff"
+                interpretacao = "Comportamento fora do padrao historico"
+
+            if anomaly_score >= 60:
+                forca = "FORTE"
+            elif anomaly_score >= 30:
+                forca = "MEDIA"
+            else:
+                forca = "FRACA"
+
+            results.append({
+                "question": parsed["question"],
+                "slug": slug,
+                "tipo": tipo,
+                "tipo_cor": tipo_cor,
+                "forca": forca,
+                "anomaly_score": anomaly_score,
+                "yes_price_atual": current_yes,
+                "yes_price_media": round(avg_yes, 1),
+                "preco_zscore": preco_zscore,
+                "preco_desvio_pct": preco_desvio,
+                "volume_24h_atual": current_vol,
+                "volume_24h_media": round(avg_vol, 1),
+                "vol_zscore": vol_zscore,
+                "total_snaps": h["total_snaps"],
+                "interpretacao": interpretacao,
+                "yes_price": parsed["yes_price"],
+                "no_price": parsed["no_price"],
+            })
+
+        results.sort(key=lambda x: x["anomaly_score"], reverse=True)
+        return results[:20]
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/reversion")
 def get_reversion():
     """Motor #3 — Reversao a Media: compara preco atual com media historica do banco"""
@@ -317,10 +442,9 @@ def get_reversion():
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
 
-        # Busca media historica de cada slug no banco
         session = Session()
         rows = session.execute(text("""
-            SELECT slug, 
+            SELECT slug,
                    AVG(yes_price) as avg_yes,
                    STDDEV(yes_price) as std_yes,
                    COUNT(*) as total_snaps,
@@ -359,35 +483,26 @@ def get_reversion():
             if avg is None or std is None:
                 continue
 
-            # Desvio do preco atual em relacao a media historica
             desvio = current - avg
             desvio_pct = round((desvio / avg) * 100, 2) if avg > 0 else 0
-
-            # Z-score — quantos desvios padrao acima/abaixo da media
             zscore = round(desvio / std, 2) if std > 1 else 0
 
-            # So mostra se desvio for relevante (>= 1 desvio padrao ou >= 3%)
             if abs(desvio_pct) < 3 and abs(zscore) < 1:
                 continue
 
-            # Direcao da reversao esperada
             if desvio > 0:
-                # Preco atual acima da media — espera queda
                 direcao = "SELL"
                 direcao_cor = "#ff453a"
                 interpretacao = f"Preco {desvio_pct:.1f}% acima da media historica — possivel reversao para baixo"
                 acao = f"Compre NO a {parsed['no_price']}%"
             else:
-                # Preco atual abaixo da media — espera alta
                 direcao = "BUY"
                 direcao_cor = "#30d158"
                 interpretacao = f"Preco {abs(desvio_pct):.1f}% abaixo da media historica — possivel reversao para cima"
                 acao = f"Compre YES a {parsed['yes_price']}%"
 
-            # Score de reversao (0-100)
             score = min(round(abs(zscore) * 25 + abs(desvio_pct) * 2, 1), 100)
 
-            # Forca do sinal
             if score >= 60:
                 forca = "FORTE"
             elif score >= 30:
