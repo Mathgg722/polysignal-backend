@@ -132,6 +132,7 @@ def parse_market(m, now):
 
 def save_snapshots(markets):
     if not Session:
+        print("❌ Session não existe")
         return
     try:
         session = Session()
@@ -151,8 +152,11 @@ def save_snapshots(markets):
         result = session.execute(text("SELECT COUNT(*) FROM snapshots")).scalar()
         state["total_snapshots"] = result
         session.close()
+        print(f"✅ Snapshots salvos: {result}")
     except Exception as e:
-        print(f"❌ Snapshot erro: {e}")
+        print(f"❌ Snapshot erro detalhado: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ── Worker ──────────────────────────────────────────────────
 def worker_loop():
