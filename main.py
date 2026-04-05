@@ -272,7 +272,7 @@ def get_signals():
 
             if change is None:
                 continue
-            if abs(change) < 0.01:
+            if abs(change) < 0.05:
                 continue
             if volume_24h < 1000:
                 continue
