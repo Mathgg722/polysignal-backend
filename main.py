@@ -272,25 +272,20 @@ def get_signals():
             parsed = parse_market(m, now)
             if not parsed:
                 continue
-
             change = parsed["change_24h"]
             volume_24h = parsed["volume_24h"]
-
             if change is None:
                 continue
             if abs(change) < 0.05:
                 continue
             if volume_24h < 1000:
                 continue
-
             signal = "BUY" if change > 0 else "SELL"
             confidence = round(min(abs(change) * 200, 95) / 100, 2)
-
             p = parsed["yes_price"] / 100 if signal == "BUY" else parsed["no_price"] / 100
             edge = abs(change)
             kelly = round((edge / max(1 - p, 0.01)) * 0.25 * 100, 1)
             kelly = min(kelly, 5.0)
-
             signals.append({
                 "question": parsed["question"],
                 "slug": parsed["slug"],
@@ -302,9 +297,169 @@ def get_signals():
                 "kelly": kelly,
                 "volume_24h": volume_24h,
             })
-
         signals.sort(key=lambda x: abs(x["change_24h"]), reverse=True)
         return signals
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/recommendations")
+def get_recommendations():
+    """Motor #6 — Recomendacoes: combina sinais + anomalias + reversao num score composto"""
+    if not Session:
+        return {"error": "Banco nao conectado"}
+    try:
+        now = datetime.now(timezone.utc)
+        all_data = fetch_all_markets()
+
+        # Busca historico do banco
+        session = Session()
+        rows = session.execute(text("""
+            SELECT slug,
+                   AVG(yes_price) as avg_yes,
+                   STDDEV(yes_price) as std_yes,
+                   AVG(volume_24h) as avg_vol,
+                   STDDEV(volume_24h) as std_vol,
+                   COUNT(*) as total_snaps
+            FROM snapshots
+            GROUP BY slug
+            HAVING COUNT(*) >= 5
+        """)).fetchall()
+        session.close()
+
+        historico = {r[0]: {
+            "avg_yes": r[1],
+            "std_yes": r[2] or 0,
+            "avg_vol": r[3] or 0,
+            "std_vol": r[4] or 0,
+            "total_snaps": r[5],
+        } for r in rows}
+
+        results = []
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if not parsed:
+                continue
+
+            slug = parsed["slug"]
+            change = parsed["change_24h"]
+            volume_24h = parsed["volume_24h"]
+            yes = parsed["yes_price"]
+            no = parsed["no_price"]
+
+            if volume_24h < 1000:
+                continue
+
+            # ── Score de Sinal (Motor #1) ──
+            sinal_score = 0
+            sinal_dir = None
+            if change is not None and abs(change) >= 0.01:
+                sinal_score = min(abs(change) * 200, 40)
+                sinal_dir = "BUY" if change > 0 else "SELL"
+
+            # ── Score de Anomalia + Reversao (Motores #2 e #3) ──
+            anomalia_score = 0
+            reversao_score = 0
+            reversao_dir = None
+            avg_yes = None
+
+            if slug in historico:
+                h = historico[slug]
+                avg_yes = h["avg_yes"]
+                std_yes = h["std_yes"]
+                avg_vol = h["avg_vol"]
+                std_vol = h["std_vol"]
+
+                if avg_yes and std_yes > 0.5:
+                    preco_zscore = (yes - avg_yes) / std_yes
+                    vol_zscore = (volume_24h - avg_vol) / std_vol if std_vol > 100 else 0
+
+                    # Anomalia
+                    intensidade = min(abs(preco_zscore) * 15, 20)
+                    surpresa = min(abs(vol_zscore) * 10, 20)
+                    anomalia_score = round(intensidade + surpresa, 1)
+
+                    # Reversao
+                    desvio = yes - avg_yes
+                    desvio_pct = abs((desvio / avg_yes) * 100) if avg_yes > 0 else 0
+                    reversao_score = min(round(abs(preco_zscore) * 10 + desvio_pct, 1), 40)
+                    reversao_dir = "SELL" if desvio > 0 else "BUY"
+
+            # ── Score composto final ──
+            # Sinal 40% + Anomalia 20% + Reversao 40%
+            score_total = round((sinal_score * 0.4) + (anomalia_score * 0.2) + (reversao_score * 0.4), 1)
+
+            if score_total < 10:
+                continue
+
+            # ── Direcao final (consenso dos motores) ──
+            votos_buy = sum([
+                1 if sinal_dir == "BUY" else 0,
+                1 if reversao_dir == "BUY" else 0,
+            ])
+            votos_sell = sum([
+                1 if sinal_dir == "SELL" else 0,
+                1 if reversao_dir == "SELL" else 0,
+            ])
+
+            if votos_buy > votos_sell:
+                direcao = "BUY"
+                direcao_cor = "#30d158"
+                entry_price = yes
+                acao = f"Compre YES a {yes}%"
+                p = yes / 100
+            elif votos_sell > votos_buy:
+                direcao = "SELL"
+                direcao_cor = "#ff453a"
+                entry_price = no
+                acao = f"Compre NO a {no}%"
+                p = no / 100
+            else:
+                continue  # empate — sem recomendacao clara
+
+            # ── Kelly ──
+            edge = abs(change) if change else 0.01
+            kelly = round((edge / max(1 - p, 0.01)) * 0.25 * 100, 1)
+            kelly = min(kelly, 5.0)
+
+            # ── Motores que confirmam ──
+            motores = []
+            if sinal_dir == direcao:
+                motores.append("Sinal")
+            if reversao_dir == direcao:
+                motores.append("Reversao")
+            if anomalia_score > 15:
+                motores.append("Anomalia")
+
+            if score_total >= 60:
+                forca = "FORTE"
+            elif score_total >= 30:
+                forca = "MEDIA"
+            else:
+                forca = "FRACA"
+
+            results.append({
+                "question": parsed["question"],
+                "slug": slug,
+                "direcao": direcao,
+                "direcao_cor": direcao_cor,
+                "forca": forca,
+                "score_total": score_total,
+                "sinal_score": round(sinal_score, 1),
+                "anomalia_score": anomalia_score,
+                "reversao_score": reversao_score,
+                "kelly": kelly,
+                "acao": acao,
+                "entry_price": entry_price,
+                "yes_price": yes,
+                "no_price": no,
+                "change_24h": round(change * 100, 2) if change else 0,
+                "volume_24h": volume_24h,
+                "motores": motores,
+                "yes_price_media": round(avg_yes, 1) if avg_yes else None,
+            })
+
+        results.sort(key=lambda x: x["score_total"], reverse=True)
+        return results[:15]
     except Exception as e:
         return {"error": str(e)}
 
@@ -316,7 +471,6 @@ def get_anomalies():
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
-
         session = Session()
         rows = session.execute(text("""
             SELECT slug,
@@ -333,12 +487,9 @@ def get_anomalies():
         session.close()
 
         historico = {r[0]: {
-            "avg_yes": r[1],
-            "std_yes": r[2] or 0,
-            "avg_vol": r[3] or 0,
-            "std_vol": r[4] or 0,
-            "total_snaps": r[5],
-            "last_snap": r[6],
+            "avg_yes": r[1], "std_yes": r[2] or 0,
+            "avg_vol": r[3] or 0, "std_vol": r[4] or 0,
+            "total_snaps": r[5], "last_snap": r[6],
         } for r in rows}
 
         results = []
@@ -346,11 +497,9 @@ def get_anomalies():
             parsed = parse_market(m, now)
             if not parsed:
                 continue
-
             slug = parsed["slug"]
             if slug not in historico:
                 continue
-
             h = historico[slug]
             avg_yes = h["avg_yes"]
             std_yes = h["std_yes"]
@@ -358,76 +507,44 @@ def get_anomalies():
             std_vol = h["std_vol"]
             current_yes = parsed["yes_price"]
             current_vol = parsed["volume_24h"]
-
             if avg_yes is None:
                 continue
-
-            # Anomalia de preco
             preco_zscore = round((current_yes - avg_yes) / std_yes, 2) if std_yes > 0.5 else 0
             preco_desvio = round(((current_yes - avg_yes) / avg_yes) * 100, 1) if avg_yes > 0 else 0
-
-            # Anomalia de volume
             vol_zscore = round((current_vol - avg_vol) / std_vol, 2) if std_vol > 100 else 0
-
-            # Score de anomalia composto
-            # Intensidade (preco) 40% + Surpresa (volume) 30% + Confirmacao (ambos alinhados) 30%
             intensidade = min(abs(preco_zscore) * 25, 40)
             surpresa = min(abs(vol_zscore) * 15, 30)
             confirmacao = 30 if (abs(preco_zscore) > 1 and abs(vol_zscore) > 1) else 0
             anomaly_score = round(intensidade + surpresa + confirmacao, 1)
-
             if anomaly_score < 15:
                 continue
-
-            # Tipo de anomalia
             if preco_zscore > 1.5 and vol_zscore > 1:
-                tipo = "SPIKE BULLISH"
-                tipo_cor = "#30d158"
+                tipo = "SPIKE BULLISH"; tipo_cor = "#30d158"
                 interpretacao = "Alta anormal com volume elevado — possivel noticia ou entrada de baleia"
             elif preco_zscore < -1.5 and vol_zscore > 1:
-                tipo = "SPIKE BEARISH"
-                tipo_cor = "#ff453a"
+                tipo = "SPIKE BEARISH"; tipo_cor = "#ff453a"
                 interpretacao = "Queda anormal com volume elevado — possivel noticia negativa"
             elif abs(preco_zscore) > 2:
-                tipo = "PRECO EXTREMO"
-                tipo_cor = "#ff9f0a"
+                tipo = "PRECO EXTREMO"; tipo_cor = "#ff9f0a"
                 interpretacao = "Preco muito distante da media historica — possivel mispricing"
             elif vol_zscore > 2:
-                tipo = "VOLUME ANORMAL"
-                tipo_cor = "#bf5af2"
+                tipo = "VOLUME ANORMAL"; tipo_cor = "#bf5af2"
                 interpretacao = "Volume muito acima do normal — atividade suspeita ou evento relevante"
             else:
-                tipo = "ANOMALIA"
-                tipo_cor = "#0a84ff"
+                tipo = "ANOMALIA"; tipo_cor = "#0a84ff"
                 interpretacao = "Comportamento fora do padrao historico"
-
-            if anomaly_score >= 60:
-                forca = "FORTE"
-            elif anomaly_score >= 30:
-                forca = "MEDIA"
-            else:
-                forca = "FRACA"
-
+            forca = "FORTE" if anomaly_score >= 60 else "MEDIA" if anomaly_score >= 30 else "FRACA"
             results.append({
-                "question": parsed["question"],
-                "slug": slug,
-                "tipo": tipo,
-                "tipo_cor": tipo_cor,
-                "forca": forca,
+                "question": parsed["question"], "slug": slug,
+                "tipo": tipo, "tipo_cor": tipo_cor, "forca": forca,
                 "anomaly_score": anomaly_score,
-                "yes_price_atual": current_yes,
-                "yes_price_media": round(avg_yes, 1),
-                "preco_zscore": preco_zscore,
-                "preco_desvio_pct": preco_desvio,
-                "volume_24h_atual": current_vol,
-                "volume_24h_media": round(avg_vol, 1),
-                "vol_zscore": vol_zscore,
-                "total_snaps": h["total_snaps"],
+                "yes_price_atual": current_yes, "yes_price_media": round(avg_yes, 1),
+                "preco_zscore": preco_zscore, "preco_desvio_pct": preco_desvio,
+                "volume_24h_atual": current_vol, "volume_24h_media": round(avg_vol, 1),
+                "vol_zscore": vol_zscore, "total_snaps": h["total_snaps"],
                 "interpretacao": interpretacao,
-                "yes_price": parsed["yes_price"],
-                "no_price": parsed["no_price"],
+                "yes_price": parsed["yes_price"], "no_price": parsed["no_price"],
             })
-
         results.sort(key=lambda x: x["anomaly_score"], reverse=True)
         return results[:20]
     except Exception as e:
@@ -435,101 +552,55 @@ def get_anomalies():
 
 @app.get("/reversion")
 def get_reversion():
-    """Motor #3 — Reversao a Media: compara preco atual com media historica do banco"""
+    """Motor #3 — Reversao a Media"""
     if not Session:
         return {"error": "Banco nao conectado"}
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
-
         session = Session()
         rows = session.execute(text("""
-            SELECT slug,
-                   AVG(yes_price) as avg_yes,
-                   STDDEV(yes_price) as std_yes,
-                   COUNT(*) as total_snaps,
-                   MIN(yes_price) as min_yes,
-                   MAX(yes_price) as max_yes
-            FROM snapshots
-            GROUP BY slug
-            HAVING COUNT(*) >= 5
+            SELECT slug, AVG(yes_price), STDDEV(yes_price), COUNT(*), MIN(yes_price), MAX(yes_price)
+            FROM snapshots GROUP BY slug HAVING COUNT(*) >= 5
         """)).fetchall()
         session.close()
-
-        historico = {r[0]: {
-            "avg_yes": r[1],
-            "std_yes": r[2] or 0,
-            "total_snaps": r[3],
-            "min_yes": r[4],
-            "max_yes": r[5],
-        } for r in rows}
-
+        historico = {r[0]: {"avg_yes": r[1], "std_yes": r[2] or 0, "total_snaps": r[3], "min_yes": r[4], "max_yes": r[5]} for r in rows}
         results = []
         for m in all_data:
             parsed = parse_market(m, now)
             if not parsed:
                 continue
-
             slug = parsed["slug"]
             if slug not in historico:
                 continue
-
             h = historico[slug]
-            avg = h["avg_yes"]
-            std = h["std_yes"]
-            current = parsed["yes_price"]
-            snaps = h["total_snaps"]
-
+            avg = h["avg_yes"]; std = h["std_yes"]; current = parsed["yes_price"]
             if avg is None or std is None:
                 continue
-
             desvio = current - avg
             desvio_pct = round((desvio / avg) * 100, 2) if avg > 0 else 0
             zscore = round(desvio / std, 2) if std > 1 else 0
-
             if abs(desvio_pct) < 3 and abs(zscore) < 1:
                 continue
-
             if desvio > 0:
-                direcao = "SELL"
-                direcao_cor = "#ff453a"
+                direcao = "SELL"; direcao_cor = "#ff453a"
                 interpretacao = f"Preco {desvio_pct:.1f}% acima da media historica — possivel reversao para baixo"
                 acao = f"Compre NO a {parsed['no_price']}%"
             else:
-                direcao = "BUY"
-                direcao_cor = "#30d158"
+                direcao = "BUY"; direcao_cor = "#30d158"
                 interpretacao = f"Preco {abs(desvio_pct):.1f}% abaixo da media historica — possivel reversao para cima"
                 acao = f"Compre YES a {parsed['yes_price']}%"
-
             score = min(round(abs(zscore) * 25 + abs(desvio_pct) * 2, 1), 100)
-
-            if score >= 60:
-                forca = "FORTE"
-            elif score >= 30:
-                forca = "MEDIA"
-            else:
-                forca = "FRACA"
-
+            forca = "FORTE" if score >= 60 else "MEDIA" if score >= 30 else "FRACA"
             results.append({
-                "question": parsed["question"],
-                "slug": slug,
-                "direcao": direcao,
-                "direcao_cor": direcao_cor,
-                "forca": forca,
-                "score": score,
-                "yes_price_atual": current,
-                "yes_price_media": round(avg, 1),
-                "yes_price_min": round(h["min_yes"], 1),
-                "yes_price_max": round(h["max_yes"], 1),
-                "desvio_pct": desvio_pct,
-                "zscore": zscore,
-                "total_snaps": snaps,
-                "interpretacao": interpretacao,
-                "acao": acao,
-                "volume_24h": parsed["volume_24h"],
-                "no_price": parsed["no_price"],
+                "question": parsed["question"], "slug": slug,
+                "direcao": direcao, "direcao_cor": direcao_cor, "forca": forca, "score": score,
+                "yes_price_atual": current, "yes_price_media": round(avg, 1),
+                "yes_price_min": round(h["min_yes"], 1), "yes_price_max": round(h["max_yes"], 1),
+                "desvio_pct": desvio_pct, "zscore": zscore, "total_snaps": h["total_snaps"],
+                "interpretacao": interpretacao, "acao": acao,
+                "volume_24h": parsed["volume_24h"], "no_price": parsed["no_price"],
             })
-
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:20]
     except Exception as e:
@@ -537,7 +608,6 @@ def get_reversion():
 
 @app.get("/orphans")
 def get_orphans():
-    """Motor #44 — Mercados Orfaos: volume < $50k, maxima ineficiencia"""
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
@@ -546,35 +616,20 @@ def get_orphans():
             parsed = parse_market(m, now)
             if not parsed:
                 continue
-
-            volume_24h = parsed["volume_24h"]
-            volume = parsed["volume"]
-            change = parsed["change_24h"]
-
-            if volume > 50000:
+            volume_24h = parsed["volume_24h"]; volume = parsed["volume"]; change = parsed["change_24h"]
+            if volume > 50000 or volume_24h > 5000:
                 continue
-            if volume_24h > 5000:
-                continue
-
-            ineficiencia = round(100 - (volume / 500), 1)
-            ineficiencia = max(0, min(100, ineficiencia))
-
+            ineficiencia = max(0, min(100, round(100 - (volume / 500), 1)))
             yes = parsed["yes_price"]
-            distancia_50 = abs(yes - 50)
-
             orphans.append({
-                "question": parsed["question"],
-                "slug": parsed["slug"],
-                "yes_price": yes,
-                "no_price": parsed["no_price"],
-                "volume": volume,
-                "volume_24h": volume_24h,
+                "question": parsed["question"], "slug": parsed["slug"],
+                "yes_price": yes, "no_price": parsed["no_price"],
+                "volume": volume, "volume_24h": volume_24h,
                 "change_24h": round(change * 100, 2) if change else 0,
                 "ineficiencia_score": ineficiencia,
-                "distancia_50": round(distancia_50, 1),
+                "distancia_50": round(abs(yes - 50), 1),
                 "tier": "orfao" if volume < 10000 else "niche",
             })
-
         orphans.sort(key=lambda x: x["ineficiencia_score"], reverse=True)
         return orphans[:30]
     except Exception as e:
@@ -582,7 +637,6 @@ def get_orphans():
 
 @app.get("/narrative")
 def get_narrative():
-    """Narrative Drift Engine — detecta forca e direcao da narrativa de cada mercado"""
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
@@ -591,35 +645,24 @@ def get_narrative():
             parsed = parse_market(m, now)
             if not parsed:
                 continue
-
-            change = parsed["change_24h"]
-            volume_24h = parsed["volume_24h"]
-
+            change = parsed["change_24h"]; volume_24h = parsed["volume_24h"]
             if change is None or volume_24h < 1000:
                 continue
-
             abs_change = abs(change)
             direction = "BULLISH" if change > 0 else "BEARISH"
             momentum = min(round(abs_change * 300, 1), 100)
             yes = parsed["yes_price"]
-            distancia_50 = abs(yes - 50)
-            convicao = round(distancia_50 * 2, 1)
+            convicao = round(abs(yes - 50) * 2, 1)
             vol_score = min(round((volume_24h / 10000) * 10, 1), 30)
             narrative_score = round((momentum * 0.5) + (convicao * 0.3) + (vol_score * 0.2), 1)
-
             if narrative_score < 15:
                 continue
-
             if narrative_score >= 65:
-                forca = "FORTE"
-                forca_color = "#30d158"
+                forca = "FORTE"; forca_color = "#30d158"
             elif narrative_score >= 35:
-                forca = "MEDIA"
-                forca_color = "#ff9f0a"
+                forca = "MEDIA"; forca_color = "#ff9f0a"
             else:
-                forca = "FRACA"
-                forca_color = "#ff453a"
-
+                forca = "FRACA"; forca_color = "#ff453a"
             if direction == "BULLISH" and forca == "FORTE":
                 interpretacao = "Narrativa bullish consolidada — momentum favorece YES"
             elif direction == "BEARISH" and forca == "FORTE":
@@ -628,23 +671,14 @@ def get_narrative():
                 interpretacao = "Narrativa em formacao — aguardar confirmacao"
             else:
                 interpretacao = "Sinal fraco — ruido provavel"
-
             results.append({
-                "question": parsed["question"],
-                "slug": parsed["slug"],
-                "direction": direction,
-                "forca": forca,
-                "forca_color": forca_color,
-                "narrative_score": narrative_score,
-                "momentum": momentum,
-                "convicao": convicao,
+                "question": parsed["question"], "slug": parsed["slug"],
+                "direction": direction, "forca": forca, "forca_color": forca_color,
+                "narrative_score": narrative_score, "momentum": momentum, "convicao": convicao,
                 "interpretacao": interpretacao,
-                "yes_price": parsed["yes_price"],
-                "no_price": parsed["no_price"],
-                "change_24h": round(change * 100, 2),
-                "volume_24h": volume_24h,
+                "yes_price": parsed["yes_price"], "no_price": parsed["no_price"],
+                "change_24h": round(change * 100, 2), "volume_24h": volume_24h,
             })
-
         results.sort(key=lambda x: x["narrative_score"], reverse=True)
         return results[:25]
     except Exception as e:
@@ -653,31 +687,22 @@ def get_narrative():
 @app.get("/kalshi")
 def get_kalshi():
     try:
-        r = requests.get(
-            "https://api.kalshi.com/trade-api/v2/markets",
-            params={"limit": 200, "status": "open"},
-            timeout=10
-        )
+        r = requests.get("https://api.kalshi.com/trade-api/v2/markets", params={"limit": 200, "status": "open"}, timeout=10)
         data = r.json()
         markets = []
         for m in data.get("markets", []):
-            yes_price = m.get("yes_ask", None)
-            no_price = m.get("no_ask", None)
+            yes_price = m.get("yes_ask"); no_price = m.get("no_ask")
             if yes_price is None or no_price is None:
                 continue
-            yes_price = round(yes_price, 1)
-            no_price = round(no_price, 1)
+            yes_price = round(yes_price, 1); no_price = round(no_price, 1)
             if yes_price < 5 or yes_price > 95:
                 continue
             markets.append({
-                "question": m.get("title", ""),
-                "slug": m.get("ticker", ""),
-                "yes_price": yes_price,
-                "no_price": no_price,
+                "question": m.get("title", ""), "slug": m.get("ticker", ""),
+                "yes_price": yes_price, "no_price": no_price,
                 "volume": round(float(m.get("volume", 0) or 0), 2),
                 "volume_24h": round(float(m.get("volume_24h", 0) or 0), 2),
-                "end_date": m.get("close_time", ""),
-                "platform": "kalshi",
+                "end_date": m.get("close_time", ""), "platform": "kalshi",
             })
         markets.sort(key=lambda x: x["volume_24h"], reverse=True)
         return markets
