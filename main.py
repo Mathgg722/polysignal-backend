@@ -185,23 +185,29 @@ def check_alerts(markets):
 
         if change is None:
             continue
-        if abs(change) < 0.01:
+        if abs(change) < 0.05:
             continue
         if volume_24h < 5000:
             continue
         if slug in alerted_slugs:
             continue
 
-        sinal = "BUY" if change > 0 else "SELL"
-        tags = "green_circle" if change > 0 else "red_circle"
+        if change > 0:
+            sinal = "BUY"
+            acao = f"Compre YES a {m['yes_price']}%"
+            tags = "green_circle"
+        else:
+            sinal = "SELL"
+            acao = f"Compre NO a {m['no_price']}%"
+            tags = "red_circle"
 
         send_alert(
             f"PolySignal {sinal}",
-            f"{m['question']}\n\nVariacao 24h: {round(change*100,1)}%\nVol 24h: ${round(volume_24h/1000,1)}k\nYES: {m['yes_price']}% | NO: {m['no_price']}%",
+            f"{m['question']}\n\nAcao: {acao}\nVariacao 24h: {round(change*100,1)}%\nVol 24h: ${round(volume_24h/1000,1)}k\nKelly: ate 5% da banca",
             tags=tags
         )
         alerted_slugs.add(slug)
-
+        
 # ── Worker ──────────────────────────────────────────────────
 def worker_loop():
     print("🔄 Worker iniciado")
