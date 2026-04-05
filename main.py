@@ -54,6 +54,25 @@ state = {
 }
 
 GAMMA = "https://gamma-api.polymarket.com"
+NTFY_TOPIC = "polysignal-matheus"
+alerted_slugs = set()
+
+# ── Ntfy ────────────────────────────────────────────────────
+def send_alert(title, message, tags="chart_with_upwards_trend"):
+    try:
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers={
+                "Title": title,
+                "Priority": "high",
+                "Tags": tags,
+            },
+            timeout=5
+        )
+        print(f"🔔 Alerta enviado: {title}")
+    except Exception as e:
+        print(f"❌ Ntfy erro: {e}")
 
 # ── Coleta ──────────────────────────────────────────────────
 def fetch_all_markets():
@@ -158,6 +177,32 @@ def save_snapshots(markets):
         import traceback
         traceback.print_exc()
 
+def check_alerts(markets):
+    for m in markets:
+        change = m.get("change_24h")
+        volume_24h = m.get("volume_24h", 0)
+        slug = m.get("slug", "")
+
+        if change is None:
+            continue
+        if abs(change) < 0.05:
+            continue
+        if volume_24h < 5000:
+            continue
+        if slug in alerted_slugs:
+            continue
+
+        sinal = "BUY" if change > 0 else "SELL"
+        emoji = "🟢" if change > 0 else "🔴"
+        tags = "green_circle" if change > 0 else "red_circle"
+
+        send_alert(
+            f"{emoji} PolySignal — {sinal} FORTE",
+            f"{m['question']}\n\nVariação 24h: {round(change*100,1)}%\nVol 24h: ${round(volume_24h/1000,1)}k\nYES: {m['yes_price']}% | NO: {m['no_price']}%",
+            tags=tags
+        )
+        alerted_slugs.add(slug)
+
 # ── Worker ──────────────────────────────────────────────────
 def worker_loop():
     print("🔄 Worker iniciado")
@@ -171,6 +216,7 @@ def worker_loop():
             state["last_collection"] = datetime.utcnow().isoformat()
             state["worker_healthy"] = True
             save_snapshots(markets)
+            check_alerts(markets)
             print(f"✅ {len(markets)} mercados coletados · {state['total_snapshots']} snapshots")
         except Exception as e:
             state["worker_healthy"] = False
@@ -193,6 +239,7 @@ def status():
         "last_collection": state["last_collection"],
         "worker_healthy": state["worker_healthy"],
         "db_connected": Session is not None,
+        "alerts_sent": len(alerted_slugs),
     }
 
 @app.get("/markets")
