@@ -39,7 +39,6 @@ class Snapshot(Base):
 if DATABASE_URL:
     try:
         engine = create_engine(DATABASE_URL.replace("postgres://", "postgresql://", 1))
-        Base.metadata.drop_all(engine)
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
         print("✅ PostgreSQL conectado")
