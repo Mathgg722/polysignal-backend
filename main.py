@@ -64,7 +64,7 @@ def send_alert(title, message, tags="chart_with_upwards_trend"):
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=message.encode("utf-8"),
             headers={
-                "Title": title,
+                "Title": title.encode("utf-8").decode("latin-1", errors="replace"),
                 "Priority": "high",
                 "Tags": tags,
             },
@@ -193,12 +193,11 @@ def check_alerts(markets):
             continue
 
         sinal = "BUY" if change > 0 else "SELL"
-        emoji = "🟢" if change > 0 else "🔴"
         tags = "green_circle" if change > 0 else "red_circle"
 
         send_alert(
-            f"{emoji} PolySignal — {sinal} FORTE",
-            f"{m['question']}\n\nVariação 24h: {round(change*100,1)}%\nVol 24h: ${round(volume_24h/1000,1)}k\nYES: {m['yes_price']}% | NO: {m['no_price']}%",
+            f"PolySignal {sinal}",
+            f"{m['question']}\n\nVariacao 24h: {round(change*100,1)}%\nVol 24h: ${round(volume_24h/1000,1)}k\nYES: {m['yes_price']}% | NO: {m['no_price']}%",
             tags=tags
         )
         alerted_slugs.add(slug)
