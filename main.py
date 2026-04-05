@@ -185,7 +185,7 @@ def check_alerts(markets):
 
         if change is None:
             continue
-        if abs(change) < 0.05:
+        if abs(change) < 0.01
             continue
         if volume_24h < 5000:
             continue
