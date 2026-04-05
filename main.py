@@ -207,7 +207,7 @@ def check_alerts(markets):
             tags=tags
         )
         alerted_slugs.add(slug)
-        
+
 # ── Worker ──────────────────────────────────────────────────
 def worker_loop():
     print("🔄 Worker iniciado")
@@ -305,6 +305,134 @@ def get_signals():
 
         signals.sort(key=lambda x: abs(x["change_24h"]), reverse=True)
         return signals
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/orphans")
+def get_orphans():
+    """Motor #44 — Mercados Órfãos: volume < $50k, máxima ineficiência"""
+    try:
+        now = datetime.now(timezone.utc)
+        all_data = fetch_all_markets()
+        orphans = []
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if not parsed:
+                continue
+
+            volume_24h = parsed["volume_24h"]
+            volume = parsed["volume"]
+            change = parsed["change_24h"]
+
+            # Órfão: volume total < $50k e volume 24h < $5k
+            if volume > 50000:
+                continue
+            if volume_24h > 5000:
+                continue
+
+            # Score de ineficiência — quanto menor o volume, maior o edge potencial
+            ineficiencia = round(100 - (volume / 500), 1)
+            ineficiencia = max(0, min(100, ineficiencia))
+
+            # Distância do 50% — mercados longe do meio têm mais opinião formada
+            yes = parsed["yes_price"]
+            distancia_50 = abs(yes - 50)
+
+            orphans.append({
+                "question": parsed["question"],
+                "slug": parsed["slug"],
+                "yes_price": yes,
+                "no_price": parsed["no_price"],
+                "volume": volume,
+                "volume_24h": volume_24h,
+                "change_24h": round(change * 100, 2) if change else 0,
+                "ineficiencia_score": ineficiencia,
+                "distancia_50": round(distancia_50, 1),
+                "tier": "orfao" if volume < 10000 else "niche",
+            })
+
+        orphans.sort(key=lambda x: x["ineficiencia_score"], reverse=True)
+        return orphans[:30]
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/narrative")
+def get_narrative():
+    """Narrative Drift Engine — detecta força e direção da narrativa de cada mercado"""
+    try:
+        now = datetime.now(timezone.utc)
+        all_data = fetch_all_markets()
+        results = []
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if not parsed:
+                continue
+
+            change = parsed["change_24h"]
+            volume_24h = parsed["volume_24h"]
+
+            if change is None or volume_24h < 1000:
+                continue
+
+            abs_change = abs(change)
+            direction = "BULLISH" if change > 0 else "BEARISH"
+
+            # Momentum narrativo — velocidade da mudança de preço
+            momentum = min(round(abs_change * 300, 1), 100)
+
+            # Convicção do mercado — distância do 50%
+            yes = parsed["yes_price"]
+            distancia_50 = abs(yes - 50)
+            convicao = round(distancia_50 * 2, 1)
+
+            # Volume score — mercados com mais volume têm narrativa mais forte
+            vol_score = min(round((volume_24h / 10000) * 10, 1), 30)
+
+            # Score final composto
+            narrative_score = round((momentum * 0.5) + (convicao * 0.3) + (vol_score * 0.2), 1)
+
+            if narrative_score < 15:
+                continue
+
+            # Classificação de força
+            if narrative_score >= 65:
+                forca = "FORTE"
+                forca_color = "#30d158"
+            elif narrative_score >= 35:
+                forca = "MEDIA"
+                forca_color = "#ff9f0a"
+            else:
+                forca = "FRACA"
+                forca_color = "#ff453a"
+
+            # Interpretação estratégica
+            if direction == "BULLISH" and forca == "FORTE":
+                interpretacao = "Narrativa bullish consolidada — momentum favorece YES"
+            elif direction == "BEARISH" and forca == "FORTE":
+                interpretacao = "Narrativa bearish consolidada — momentum favorece NO"
+            elif forca == "MEDIA":
+                interpretacao = "Narrativa em formacao — aguardar confirmacao"
+            else:
+                interpretacao = "Sinal fraco — ruido provavel"
+
+            results.append({
+                "question": parsed["question"],
+                "slug": parsed["slug"],
+                "direction": direction,
+                "forca": forca,
+                "forca_color": forca_color,
+                "narrative_score": narrative_score,
+                "momentum": momentum,
+                "convicao": convicao,
+                "interpretacao": interpretacao,
+                "yes_price": parsed["yes_price"],
+                "no_price": parsed["no_price"],
+                "change_24h": round(change * 100, 2),
+                "volume_24h": volume_24h,
+            })
+
+        results.sort(key=lambda x: x["narrative_score"], reverse=True)
+        return results[:25]
     except Exception as e:
         return {"error": str(e)}
 
