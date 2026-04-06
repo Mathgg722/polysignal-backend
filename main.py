@@ -37,7 +37,14 @@ class Snapshot(Base):
 
 if DATABASE_URL:
     try:
-        engine = create_engine(DATABASE_URL.replace("postgres://", "postgresql://", 1))
+        # pool_pre_ping=True é essencial pro Neon (escala a zero quando inativo)
+        engine = create_engine(
+            DATABASE_URL.replace("postgres://", "postgresql://", 1),
+            pool_pre_ping=True,
+            pool_size=3,
+            max_overflow=0,
+            pool_recycle=300,
+        )
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
         print("✅ PostgreSQL conectado")
@@ -194,27 +201,17 @@ def build_recommendations_snapshot(markets, historico):
         yes = m["yes_price"]
         no = m["no_price"]
         days = m["days_to_close"]
-
         if volume_24h < 1000:
             continue
-
-        sinal_score = 0
-        sinal_dir = None
+        sinal_score = 0; sinal_dir = None
         if change is not None and abs(change) >= 0.01:
             sinal_score = min(abs(change) * 200, 40)
             sinal_dir = "BUY" if change > 0 else "SELL"
-
-        anomalia_score = 0
-        reversao_score = 0
-        reversao_dir = None
-        avg_yes = None
-
+        anomalia_score = 0; reversao_score = 0; reversao_dir = None; avg_yes = None
         if slug in historico:
             h = historico[slug]
-            avg_yes = h["avg_yes"]
-            std_yes = h["std_yes"]
-            avg_vol = h["avg_vol"]
-            std_vol = h["std_vol"]
+            avg_yes = h["avg_yes"]; std_yes = h["std_yes"]
+            avg_vol = h["avg_vol"]; std_vol = h["std_vol"]
             if avg_yes and std_yes > 0.5:
                 preco_zscore = (yes - avg_yes) / std_yes
                 vol_zscore = (volume_24h - avg_vol) / std_vol if std_vol > 100 else 0
@@ -223,47 +220,30 @@ def build_recommendations_snapshot(markets, historico):
                 desvio_pct = abs((desvio / avg_yes) * 100) if avg_yes > 0 else 0
                 reversao_score = min(round(abs(preco_zscore) * 10 + desvio_pct, 1), 40)
                 reversao_dir = "SELL" if desvio > 0 else "BUY"
-
         prazo_bonus = 0
         if days is not None:
             if days <= 1: prazo_bonus = 20
             elif days <= 3: prazo_bonus = 15
             elif days <= 7: prazo_bonus = 10
             elif days <= 30: prazo_bonus = 5
-
         score_total = round((sinal_score * 0.35) + (anomalia_score * 0.15) + (reversao_score * 0.35) + (prazo_bonus * 0.15), 1)
-
         if score_total < 8:
             continue
-
         votos_buy = (1 if sinal_dir == "BUY" else 0) + (1 if reversao_dir == "BUY" else 0)
         votos_sell = (1 if sinal_dir == "SELL" else 0) + (1 if reversao_dir == "SELL" else 0)
-
         if votos_buy > votos_sell:
-            direcao = "COMPRE SIM"
-            acao = f"Compre SIM (YES) a {yes}%"
-            p = yes / 100
+            direcao = "COMPRE SIM"; acao = f"Compre SIM (YES) a {yes}%"; p = yes / 100
         elif votos_sell > votos_buy:
-            direcao = "COMPRE NAO"
-            acao = f"Compre NAO (NO) a {no}%"
-            p = no / 100
+            direcao = "COMPRE NAO"; acao = f"Compre NAO (NO) a {no}%"; p = no / 100
         else:
             continue
-
         edge = abs(change) if change else 0.01
         kelly = min(round((edge / max(1 - p, 0.01)) * 0.25 * 100, 1), 5.0)
-
         results.append({
-            "question": m["question"],
-            "direcao": direcao,
-            "acao": acao,
-            "kelly": kelly,
-            "score_total": score_total,
-            "days_to_close": days,
-            "change_24h": round(change * 100, 2) if change else 0,
-            "volume_24h": volume_24h,
+            "question": m["question"], "direcao": direcao, "acao": acao,
+            "kelly": kelly, "score_total": score_total, "days_to_close": days,
+            "change_24h": round(change * 100, 2) if change else 0, "volume_24h": volume_24h,
         })
-
     results.sort(key=lambda x: x["score_total"], reverse=True)
     return results[:5]
 
@@ -271,45 +251,23 @@ def send_hourly_summary(markets, historico):
     try:
         hora = datetime.now().strftime("%H:%M")
         recs = build_recommendations_snapshot(markets, historico)
-
         if not recs:
-            send_alert(
-                f"PolySignal {hora} — Sem apostas agora",
-                "Nenhuma oportunidade com consenso detectada neste momento.\n\nO sistema continua monitorando. Volte na proxima hora.",
-                tags="hourglass_flowing_sand"
-            )
+            send_alert(f"PolySignal {hora} — Sem apostas agora",
+                "Nenhuma oportunidade com consenso detectada neste momento.\n\nO sistema continua monitorando.",
+                tags="hourglass_flowing_sand")
             return
-
-        linhas = [f"RESUMO HORARIO — {hora}\n"]
-        linhas.append(f"{len(recs)} APOSTA(S) IDENTIFICADA(S):\n")
-        linhas.append("=" * 30)
-
+        linhas = [f"RESUMO HORARIO — {hora}\n", f"{len(recs)} APOSTA(S) IDENTIFICADA(S):\n", "=" * 30]
         for i, r in enumerate(recs):
             emoji = "COMPRE SIM" if "SIM" in r["direcao"] else "COMPRE NAO"
-            dias_txt = f"Fecha em {r['days_to_close']} dias" if r['days_to_close'] is not None else "Sem prazo definido"
+            dias_txt = f"Fecha em {r['days_to_close']} dias" if r['days_to_close'] is not None else "Sem prazo"
             var_txt = f"+{r['change_24h']}%" if r['change_24h'] > 0 else f"{r['change_24h']}%"
-
-            linhas.append(f"\n#{i+1} — {emoji}")
-            linhas.append(f"Pergunta: {r['question']}")
-            linhas.append(f"O que fazer: {r['acao']}")
-            linhas.append(f"Variacao hoje: {var_txt}")
-            linhas.append(f"Volume negociado: ${round(r['volume_24h']/1000, 1)}k")
-            linhas.append(f"Prazo: {dias_txt}")
-            linhas.append(f"Quanto apostar: ate {r['kelly']}% do seu dinheiro")
-            linhas.append(f"Confianca do sistema: {r['score_total']}/100")
-
-        linhas.append("\n" + "=" * 30)
-        linhas.append("REGRAS:")
-        linhas.append("- Nunca aposte mais do que o sistema indica")
-        linhas.append("- Diversifique entre as apostas")
-        linhas.append("- Em caso de duvida, nao aposte")
-
-        mensagem = "\n".join(linhas)
-        send_alert(
-            f"PolySignal {hora} — {len(recs)} aposta(s)",
-            mensagem,
-            tags="bar_chart"
-        )
+            linhas += [f"\n#{i+1} — {emoji}", f"Pergunta: {r['question']}", f"O que fazer: {r['acao']}",
+                f"Variacao hoje: {var_txt}", f"Volume: ${round(r['volume_24h']/1000,1)}k",
+                f"Prazo: {dias_txt}", f"Quanto apostar: ate {r['kelly']}% do seu dinheiro",
+                f"Confianca: {r['score_total']}/100"]
+        linhas += ["\n" + "=" * 30, "REGRAS:", "- Nunca aposte mais do que o sistema indica",
+            "- Diversifique entre as apostas", "- Em caso de duvida, nao aposte"]
+        send_alert(f"PolySignal {hora} — {len(recs)} aposta(s)", "\n".join(linhas), tags="bar_chart")
         print(f"📊 Resumo horario enviado: {len(recs)} apostas")
     except Exception as e:
         print(f"❌ Resumo horario erro: {e}")
@@ -317,7 +275,6 @@ def send_hourly_summary(markets, historico):
 def worker_loop():
     print("🔄 Worker iniciado")
     last_summary_hour = -1
-
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -329,7 +286,6 @@ def worker_loop():
             state["worker_healthy"] = True
             save_snapshots(markets)
             check_alerts(markets)
-
             hora_atual = datetime.now().hour
             if hora_atual != last_summary_hour:
                 historico = {}
@@ -346,7 +302,6 @@ def worker_loop():
                         print(f"❌ Historico erro: {e}")
                 send_hourly_summary(markets, historico)
                 last_summary_hour = hora_atual
-
             print(f"✅ {len(markets)} mercados · {state['total_snapshots']} snapshots")
         except Exception as e:
             state["worker_healthy"] = False
@@ -402,12 +357,10 @@ def get_closing_soon(max_days: int = Query(default=7)):
             days = parsed["days_to_close"]
             if days is None or days > max_days:
                 continue
-            change = parsed["change_24h"]
-            volume_24h = parsed["volume_24h"]
+            change = parsed["change_24h"]; volume_24h = parsed["volume_24h"]
             yes = parsed["yes_price"]
             urgencia = max(0, 100 - (days * 14))
-            movimento = 0
-            direcao = None
+            movimento = 0; direcao = None
             if change is not None and abs(change) >= 0.005:
                 movimento = min(abs(change) * 300, 50)
                 direcao = "BUY" if change > 0 else "SELL"
@@ -415,12 +368,9 @@ def get_closing_soon(max_days: int = Query(default=7)):
             score = round(urgencia * 0.5 + movimento * 0.3 + vol_score * 0.2, 1)
             if score < 10:
                 continue
-            if direcao == "BUY":
-                acao = f"Compre YES a {yes}%"; acao_cor = "#30d158"
-            elif direcao == "SELL":
-                acao = f"Compre NO a {parsed['no_price']}%"; acao_cor = "#ff453a"
-            else:
-                acao = "Monitorar — sem sinal claro"; acao_cor = "#ff9f0a"
+            if direcao == "BUY": acao = f"Compre YES a {yes}%"; acao_cor = "#30d158"
+            elif direcao == "SELL": acao = f"Compre NO a {parsed['no_price']}%"; acao_cor = "#ff453a"
+            else: acao = "Monitorar — sem sinal claro"; acao_cor = "#ff9f0a"
             if days == 0: urgencia_label = "HOJE"; urgencia_cor = "#ff453a"
             elif days == 1: urgencia_label = "AMANHA"; urgencia_cor = "#ff453a"
             elif days <= 3: urgencia_label = f"{days} DIAS"; urgencia_cor = "#ff9f0a"
@@ -450,8 +400,7 @@ def get_signals(max_days: int = Query(default=0)):
                 continue
             if max_days > 0 and (parsed["days_to_close"] is None or parsed["days_to_close"] > max_days):
                 continue
-            change = parsed["change_24h"]
-            volume_24h = parsed["volume_24h"]
+            change = parsed["change_24h"]; volume_24h = parsed["volume_24h"]
             if change is None or abs(change) < 0.05 or volume_24h < 1000:
                 continue
             signal = "BUY" if change > 0 else "SELL"
@@ -483,7 +432,6 @@ def get_recommendations(max_days: int = Query(default=0)):
         """)).fetchall()
         session.close()
         historico = {r[0]: {"avg_yes": r[1], "std_yes": r[2] or 0, "avg_vol": r[3] or 0, "std_vol": r[4] or 0, "total_snaps": r[5]} for r in rows}
-
         results = []
         for m in all_data:
             parsed = parse_market(m, now)
@@ -491,12 +439,8 @@ def get_recommendations(max_days: int = Query(default=0)):
                 continue
             if max_days > 0 and (parsed["days_to_close"] is None or parsed["days_to_close"] > max_days):
                 continue
-            slug = parsed["slug"]
-            change = parsed["change_24h"]
-            volume_24h = parsed["volume_24h"]
-            yes = parsed["yes_price"]
-            no = parsed["no_price"]
-            days = parsed["days_to_close"]
+            slug = parsed["slug"]; change = parsed["change_24h"]; volume_24h = parsed["volume_24h"]
+            yes = parsed["yes_price"]; no = parsed["no_price"]; days = parsed["days_to_close"]
             if volume_24h < 1000:
                 continue
             sinal_score = 0; sinal_dir = None
@@ -505,8 +449,7 @@ def get_recommendations(max_days: int = Query(default=0)):
                 sinal_dir = "BUY" if change > 0 else "SELL"
             anomalia_score = 0; reversao_score = 0; reversao_dir = None; avg_yes = None
             if slug in historico:
-                h = historico[slug]
-                avg_yes = h["avg_yes"]; std_yes = h["std_yes"]
+                h = historico[slug]; avg_yes = h["avg_yes"]; std_yes = h["std_yes"]
                 avg_vol = h["avg_vol"]; std_vol = h["std_vol"]
                 if avg_yes and std_yes > 0.5:
                     preco_zscore = (yes - avg_yes) / std_yes
@@ -528,11 +471,9 @@ def get_recommendations(max_days: int = Query(default=0)):
             votos_buy = (1 if sinal_dir == "BUY" else 0) + (1 if reversao_dir == "BUY" else 0)
             votos_sell = (1 if sinal_dir == "SELL" else 0) + (1 if reversao_dir == "SELL" else 0)
             if votos_buy > votos_sell:
-                direcao = "BUY"; direcao_cor = "#30d158"
-                acao = f"Compre YES a {yes}%"; p = yes / 100
+                direcao = "BUY"; direcao_cor = "#30d158"; acao = f"Compre YES a {yes}%"; p = yes / 100
             elif votos_sell > votos_buy:
-                direcao = "SELL"; direcao_cor = "#ff453a"
-                acao = f"Compre NO a {no}%"; p = no / 100
+                direcao = "SELL"; direcao_cor = "#ff453a"; acao = f"Compre NO a {no}%"; p = no / 100
             else:
                 continue
             edge = abs(change) if change else 0.01
@@ -551,8 +492,7 @@ def get_recommendations(max_days: int = Query(default=0)):
                 "prazo_bonus": prazo_bonus, "kelly": kelly, "acao": acao,
                 "yes_price": yes, "no_price": no,
                 "change_24h": round(change * 100, 2) if change else 0,
-                "volume_24h": volume_24h, "days_to_close": days,
-                "motores": motores,
+                "volume_24h": volume_24h, "days_to_close": days, "motores": motores,
                 "yes_price_media": round(avg_yes, 1) if avg_yes else None,
             })
         results.sort(key=lambda x: x["score_total"], reverse=True)
@@ -584,8 +524,7 @@ def get_anomalies(max_days: int = Query(default=0)):
             slug = parsed["slug"]
             if slug not in historico:
                 continue
-            h = historico[slug]
-            avg_yes = h["avg_yes"]; std_yes = h["std_yes"]
+            h = historico[slug]; avg_yes = h["avg_yes"]; std_yes = h["std_yes"]
             avg_vol = h["avg_vol"]; std_vol = h["std_vol"]
             current_yes = parsed["yes_price"]; current_vol = parsed["volume_24h"]
             if avg_yes is None:
@@ -596,31 +535,19 @@ def get_anomalies(max_days: int = Query(default=0)):
             anomaly_score = round(min(abs(preco_zscore) * 25, 40) + min(abs(vol_zscore) * 15, 30) + (30 if abs(preco_zscore) > 1 and abs(vol_zscore) > 1 else 0), 1)
             if anomaly_score < 15:
                 continue
-            if preco_zscore > 1.5 and vol_zscore > 1:
-                tipo = "SPIKE BULLISH"; tipo_cor = "#30d158"
-                interpretacao = "Alta anormal com volume elevado — possivel noticia ou entrada de baleia"
-            elif preco_zscore < -1.5 and vol_zscore > 1:
-                tipo = "SPIKE BEARISH"; tipo_cor = "#ff453a"
-                interpretacao = "Queda anormal com volume elevado — possivel noticia negativa"
-            elif abs(preco_zscore) > 2:
-                tipo = "PRECO EXTREMO"; tipo_cor = "#ff9f0a"
-                interpretacao = "Preco muito distante da media historica — possivel mispricing"
-            elif vol_zscore > 2:
-                tipo = "VOLUME ANORMAL"; tipo_cor = "#bf5af2"
-                interpretacao = "Volume muito acima do normal — atividade suspeita"
-            else:
-                tipo = "ANOMALIA"; tipo_cor = "#0a84ff"
-                interpretacao = "Comportamento fora do padrao historico"
+            if preco_zscore > 1.5 and vol_zscore > 1: tipo = "SPIKE BULLISH"; tipo_cor = "#30d158"; interpretacao = "Alta anormal com volume elevado"
+            elif preco_zscore < -1.5 and vol_zscore > 1: tipo = "SPIKE BEARISH"; tipo_cor = "#ff453a"; interpretacao = "Queda anormal com volume elevado"
+            elif abs(preco_zscore) > 2: tipo = "PRECO EXTREMO"; tipo_cor = "#ff9f0a"; interpretacao = "Preco muito distante da media historica"
+            elif vol_zscore > 2: tipo = "VOLUME ANORMAL"; tipo_cor = "#bf5af2"; interpretacao = "Volume muito acima do normal"
+            else: tipo = "ANOMALIA"; tipo_cor = "#0a84ff"; interpretacao = "Comportamento fora do padrao historico"
             forca = "FORTE" if anomaly_score >= 60 else "MEDIA" if anomaly_score >= 30 else "FRACA"
             results.append({
                 "question": parsed["question"], "slug": slug,
-                "tipo": tipo, "tipo_cor": tipo_cor, "forca": forca,
-                "anomaly_score": anomaly_score,
+                "tipo": tipo, "tipo_cor": tipo_cor, "forca": forca, "anomaly_score": anomaly_score,
                 "yes_price_atual": current_yes, "yes_price_media": round(avg_yes, 1),
                 "preco_zscore": preco_zscore, "preco_desvio_pct": preco_desvio,
                 "volume_24h_atual": current_vol, "volume_24h_media": round(avg_vol, 1),
-                "vol_zscore": vol_zscore, "total_snaps": h["total_snaps"],
-                "interpretacao": interpretacao,
+                "vol_zscore": vol_zscore, "total_snaps": h["total_snaps"], "interpretacao": interpretacao,
                 "yes_price": parsed["yes_price"], "no_price": parsed["no_price"],
                 "days_to_close": parsed["days_to_close"],
             })
@@ -653,8 +580,7 @@ def get_reversion(max_days: int = Query(default=0)):
             slug = parsed["slug"]
             if slug not in historico:
                 continue
-            h = historico[slug]
-            avg = h["avg_yes"]; std = h["std_yes"]; current = parsed["yes_price"]
+            h = historico[slug]; avg = h["avg_yes"]; std = h["std_yes"]; current = parsed["yes_price"]
             if avg is None or std is None:
                 continue
             desvio = current - avg
@@ -698,8 +624,7 @@ def get_history(slug: str, hours: int = Query(default=24)):
         points = [{"yes_price": r[0], "no_price": r[1], "volume_24h": r[2], "time": r[3].isoformat() if r[3] else None} for r in rows]
         if not points:
             return {"slug": slug, "points": [], "total": 0}
-        first = points[0]["yes_price"]
-        last = points[-1]["yes_price"]
+        first = points[0]["yes_price"]; last = points[-1]["yes_price"]
         change = round(last - first, 1)
         change_pct = round((change / first) * 100, 2) if first > 0 else 0
         return {"slug": slug, "points": points, "total": len(points), "yes_first": first, "yes_last": last, "change": change, "change_pct": change_pct}
