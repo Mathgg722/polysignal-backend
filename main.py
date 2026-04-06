@@ -1252,12 +1252,221 @@ def analyze_resolution(question: str, description: str, yes_price: float, no_pri
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUBSTITUIR as funções get_resolution e get_resolution_by_slug no main.py
+# Versão 2 — usa endpoint /events que contém description
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.get("/resolution")
 def get_resolution(
-    max_days:   int = Query(default=90),
-    nivel:      str = Query(default=""),  # filtrar por SEGURO, ATENÇÃO, ARMADILHA
-    top:        int = Query(default=30),
+    max_days: int = Query(default=90),
+    nivel:    str = Query(default=""),
+    top:      int = Query(default=30),
 ):
+    """
+    Motor #48 — Detector de Resolução Especial
+    Usa o endpoint /events da Gamma API que contém description completa.
+    """
+    try:
+        now     = datetime.now(timezone.utc)
+        results = []
+        offset  = 0
+        limit   = 100
+
+        while True:
+            try:
+                r = requests.get(f"{GAMMA}/events", params={
+                    "active": True, "closed": False,
+                    "limit": limit, "offset": offset,
+                }, timeout=15)
+                events = r.json()
+                if not events:
+                    break
+
+                for event in events:
+                    description = event.get("description", "") or ""
+                    markets_raw = event.get("markets", [])
+
+                    for m_raw in markets_raw:
+                        # parse manual do mercado dentro do evento
+                        try:
+                            outcomes = json.loads(m_raw.get("outcomes", "[]"))
+                            prices   = json.loads(m_raw.get("outcomePrices", "[]"))
+                        except Exception:
+                            continue
+
+                        yes_price = no_price = None
+                        for i, outcome in enumerate(outcomes):
+                            try:
+                                price = round(float(prices[i]) * 100, 1)
+                            except Exception:
+                                price = None
+                            if str(outcome).upper() == "YES":
+                                yes_price = price
+                            elif str(outcome).upper() == "NO":
+                                no_price = price
+
+                        if yes_price is None or no_price is None:
+                            continue
+                        if yes_price < FILTER_MIN_PRICE or yes_price > FILTER_MAX_PRICE:
+                            continue
+
+                        end_date_str = m_raw.get("endDate", "")
+                        days_to_close = None
+                        try:
+                            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                            if end_date < now:
+                                continue
+                            days_to_close = (end_date - now).days
+                        except Exception:
+                            continue
+
+                        if max_days > 0 and (days_to_close is None or days_to_close > max_days):
+                            continue
+
+                        question   = m_raw.get("question", event.get("title", ""))
+                        slug       = m_raw.get("slug", "")
+                        volume     = round(float(m_raw.get("volume", 0) or 0), 2)
+                        volume_24h = round(float(m_raw.get("volume24hr", 0) or 0), 2)
+
+                        if volume < FILTER_MIN_VOLUME:
+                            continue
+
+                        analysis = analyze_resolution(question, description, yes_price, no_price)
+
+                        if nivel and analysis["nivel"] != nivel:
+                            continue
+
+                        tier = get_volume_tier(volume)
+
+                        results.append({
+                            "question":      question,
+                            "slug":          slug,
+                            "yes_price":     yes_price,
+                            "no_price":      no_price,
+                            "days_to_close": days_to_close,
+                            "volume_24h":    volume_24h,
+                            "tier":          tier["tier"],
+                            "tier_label":    tier["label"],
+                            "resolution":    analysis,
+                        })
+
+                if len(events) < limit:
+                    break
+                offset += limit
+                if offset > 300:
+                    break
+            except Exception as ex:
+                print(f"Resolution loop erro: {ex}")
+                break
+
+        level_order = {"ARMADILHA": 0, "ATENÇÃO": 1, "SEGURO": 2}
+        results.sort(key=lambda x: (level_order.get(x["resolution"]["nivel"], 3), -x["volume_24h"]))
+        return results[:top]
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/resolution/{slug}")
+def get_resolution_by_slug(slug: str):
+    """
+    Analisa as regras de um mercado específico.
+    Use antes de apostar para saber exatamente o que resolve YES ou NO.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+
+        # busca evento pelo slug
+        r = requests.get(f"{GAMMA}/events", params={
+            "slug": slug, "limit": 5
+        }, timeout=10)
+        events = r.json()
+
+        description = ""
+        yes_price = no_price = None
+        days_to_close = None
+        end_date_str = ""
+        volume_24h = 0
+        question = slug
+
+        # tenta encontrar o mercado no evento
+        for event in (events if isinstance(events, list) else []):
+            desc = event.get("description", "")
+            if desc:
+                description = desc
+
+            for m_raw in event.get("markets", []):
+                m_slug = m_raw.get("slug", "")
+                if slug not in m_slug and m_slug not in slug:
+                    continue
+                try:
+                    outcomes = json.loads(m_raw.get("outcomes", "[]"))
+                    prices   = json.loads(m_raw.get("outcomePrices", "[]"))
+                    for i, outcome in enumerate(outcomes):
+                        price = round(float(prices[i]) * 100, 1)
+                        if str(outcome).upper() == "YES": yes_price = price
+                        elif str(outcome).upper() == "NO": no_price = price
+                except Exception:
+                    pass
+                question     = m_raw.get("question", event.get("title", slug))
+                end_date_str = m_raw.get("endDate", "")
+                volume_24h   = round(float(m_raw.get("volume24hr", 0) or 0), 2)
+                try:
+                    end_date      = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    days_to_close = (end_date - now).days
+                except Exception:
+                    pass
+                break
+            if yes_price is not None:
+                break
+
+        # fallback: busca mercado direto
+        if yes_price is None:
+            r2   = requests.get(f"{GAMMA}/markets", params={"slug": slug, "limit": 1}, timeout=10)
+            mdata= r2.json()
+            if mdata:
+                m = mdata[0]
+                try:
+                    outcomes = json.loads(m.get("outcomes", "[]"))
+                    prices   = json.loads(m.get("outcomePrices", "[]"))
+                    for i, outcome in enumerate(outcomes):
+                        price = round(float(prices[i]) * 100, 1)
+                        if str(outcome).upper() == "YES": yes_price = price
+                        elif str(outcome).upper() == "NO": no_price = price
+                except Exception:
+                    pass
+                question     = m.get("question", slug)
+                end_date_str = m.get("endDate", "")
+                volume_24h   = round(float(m.get("volume24hr", 0) or 0), 2)
+                if not description:
+                    description = m.get("description", "") or ""
+                try:
+                    end_date      = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    days_to_close = (end_date - now).days
+                except Exception:
+                    pass
+
+        if yes_price is None:
+            return {"error": "Mercado não encontrado ou sem dados de preço"}
+
+        analysis = analyze_resolution(question, description, yes_price, no_price)
+
+        return {
+            "question":      question,
+            "slug":          slug,
+            "yes_price":     yes_price,
+            "no_price":      no_price,
+            "days_to_close": days_to_close,
+            "end_date":      end_date_str,
+            "volume_24h":    volume_24h,
+            "description":   description,
+            "resolution":    analysis,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
     """
     Motor #48 — Detector de Resolução Especial
     Analisa as regras de cada mercado e identifica pegadinhas.
@@ -1324,42 +1533,214 @@ def get_resolution(
         return {"error": str(e)}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUBSTITUIR as funções get_resolution e get_resolution_by_slug no main.py
+# Versão 2 — usa endpoint /events que contém description
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/resolution")
+def get_resolution(
+    max_days: int = Query(default=90),
+    nivel:    str = Query(default=""),
+    top:      int = Query(default=30),
+):
+    """
+    Motor #48 — Detector de Resolução Especial
+    Usa o endpoint /events da Gamma API que contém description completa.
+    """
+    try:
+        now     = datetime.now(timezone.utc)
+        results = []
+        offset  = 0
+        limit   = 100
+
+        while True:
+            try:
+                r = requests.get(f"{GAMMA}/events", params={
+                    "active": True, "closed": False,
+                    "limit": limit, "offset": offset,
+                }, timeout=15)
+                events = r.json()
+                if not events:
+                    break
+
+                for event in events:
+                    description = event.get("description", "") or ""
+                    markets_raw = event.get("markets", [])
+
+                    for m_raw in markets_raw:
+                        # parse manual do mercado dentro do evento
+                        try:
+                            outcomes = json.loads(m_raw.get("outcomes", "[]"))
+                            prices   = json.loads(m_raw.get("outcomePrices", "[]"))
+                        except Exception:
+                            continue
+
+                        yes_price = no_price = None
+                        for i, outcome in enumerate(outcomes):
+                            try:
+                                price = round(float(prices[i]) * 100, 1)
+                            except Exception:
+                                price = None
+                            if str(outcome).upper() == "YES":
+                                yes_price = price
+                            elif str(outcome).upper() == "NO":
+                                no_price = price
+
+                        if yes_price is None or no_price is None:
+                            continue
+                        if yes_price < FILTER_MIN_PRICE or yes_price > FILTER_MAX_PRICE:
+                            continue
+
+                        end_date_str = m_raw.get("endDate", "")
+                        days_to_close = None
+                        try:
+                            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                            if end_date < now:
+                                continue
+                            days_to_close = (end_date - now).days
+                        except Exception:
+                            continue
+
+                        if max_days > 0 and (days_to_close is None or days_to_close > max_days):
+                            continue
+
+                        question   = m_raw.get("question", event.get("title", ""))
+                        slug       = m_raw.get("slug", "")
+                        volume     = round(float(m_raw.get("volume", 0) or 0), 2)
+                        volume_24h = round(float(m_raw.get("volume24hr", 0) or 0), 2)
+
+                        if volume < FILTER_MIN_VOLUME:
+                            continue
+
+                        analysis = analyze_resolution(question, description, yes_price, no_price)
+
+                        if nivel and analysis["nivel"] != nivel:
+                            continue
+
+                        tier = get_volume_tier(volume)
+
+                        results.append({
+                            "question":      question,
+                            "slug":          slug,
+                            "yes_price":     yes_price,
+                            "no_price":      no_price,
+                            "days_to_close": days_to_close,
+                            "volume_24h":    volume_24h,
+                            "tier":          tier["tier"],
+                            "tier_label":    tier["label"],
+                            "resolution":    analysis,
+                        })
+
+                if len(events) < limit:
+                    break
+                offset += limit
+                if offset > 300:
+                    break
+            except Exception as ex:
+                print(f"Resolution loop erro: {ex}")
+                break
+
+        level_order = {"ARMADILHA": 0, "ATENÇÃO": 1, "SEGURO": 2}
+        results.sort(key=lambda x: (level_order.get(x["resolution"]["nivel"], 3), -x["volume_24h"]))
+        return results[:top]
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/resolution/{slug}")
 def get_resolution_by_slug(slug: str):
     """
-    Analisa as regras de resolução de um mercado específico.
-    Use antes de apostar para entender exatamente o que resolve YES ou NO.
+    Analisa as regras de um mercado específico.
+    Use antes de apostar para saber exatamente o que resolve YES ou NO.
     """
     try:
         now = datetime.now(timezone.utc)
-        # busca mercado específico
-        r = requests.get(f"{GAMMA}/markets", params={
-            "active": True, "closed": False, "slug": slug, "limit": 1
+
+        # busca evento pelo slug
+        r = requests.get(f"{GAMMA}/events", params={
+            "slug": slug, "limit": 5
         }, timeout=10)
-        data = r.json()
+        events = r.json()
 
-        if not data:
-            return {"error": "Mercado não encontrado"}
+        description = ""
+        yes_price = no_price = None
+        days_to_close = None
+        end_date_str = ""
+        volume_24h = 0
+        question = slug
 
-        m      = data[0]
-        parsed = parse_market(m, now)
-        if not parsed:
-            return {"error": "Mercado inválido ou fechado"}
+        # tenta encontrar o mercado no evento
+        for event in (events if isinstance(events, list) else []):
+            desc = event.get("description", "")
+            if desc:
+                description = desc
 
-        description = m.get("description", "") or m.get("rules", "") or ""
-        analysis    = analyze_resolution(
-            parsed["question"], description,
-            parsed["yes_price"], parsed["no_price"]
-        )
+            for m_raw in event.get("markets", []):
+                m_slug = m_raw.get("slug", "")
+                if slug not in m_slug and m_slug not in slug:
+                    continue
+                try:
+                    outcomes = json.loads(m_raw.get("outcomes", "[]"))
+                    prices   = json.loads(m_raw.get("outcomePrices", "[]"))
+                    for i, outcome in enumerate(outcomes):
+                        price = round(float(prices[i]) * 100, 1)
+                        if str(outcome).upper() == "YES": yes_price = price
+                        elif str(outcome).upper() == "NO": no_price = price
+                except Exception:
+                    pass
+                question     = m_raw.get("question", event.get("title", slug))
+                end_date_str = m_raw.get("endDate", "")
+                volume_24h   = round(float(m_raw.get("volume24hr", 0) or 0), 2)
+                try:
+                    end_date      = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    days_to_close = (end_date - now).days
+                except Exception:
+                    pass
+                break
+            if yes_price is not None:
+                break
+
+        # fallback: busca mercado direto
+        if yes_price is None:
+            r2   = requests.get(f"{GAMMA}/markets", params={"slug": slug, "limit": 1}, timeout=10)
+            mdata= r2.json()
+            if mdata:
+                m = mdata[0]
+                try:
+                    outcomes = json.loads(m.get("outcomes", "[]"))
+                    prices   = json.loads(m.get("outcomePrices", "[]"))
+                    for i, outcome in enumerate(outcomes):
+                        price = round(float(prices[i]) * 100, 1)
+                        if str(outcome).upper() == "YES": yes_price = price
+                        elif str(outcome).upper() == "NO": no_price = price
+                except Exception:
+                    pass
+                question     = m.get("question", slug)
+                end_date_str = m.get("endDate", "")
+                volume_24h   = round(float(m.get("volume24hr", 0) or 0), 2)
+                if not description:
+                    description = m.get("description", "") or ""
+                try:
+                    end_date      = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    days_to_close = (end_date - now).days
+                except Exception:
+                    pass
+
+        if yes_price is None:
+            return {"error": "Mercado não encontrado ou sem dados de preço"}
+
+        analysis = analyze_resolution(question, description, yes_price, no_price)
 
         return {
-            "question":      parsed["question"],
+            "question":      question,
             "slug":          slug,
-            "yes_price":     parsed["yes_price"],
-            "no_price":      parsed["no_price"],
-            "days_to_close": parsed["days_to_close"],
-            "end_date":      parsed["end_date"],
-            "volume_24h":    parsed["volume_24h"],
+            "yes_price":     yes_price,
+            "no_price":      no_price,
+            "days_to_close": days_to_close,
+            "end_date":      end_date_str,
+            "volume_24h":    volume_24h,
             "description":   description,
             "resolution":    analysis,
         }
