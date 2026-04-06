@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, String, Float, DateTime, Integer, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -7,9 +7,9 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-app = FastAPI(title="PolySignal API", version="2.0")
+app = FastAPI(title="PolySignal API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,7 +45,6 @@ if DATABASE_URL:
     except Exception as e:
         print(f"❌ PostgreSQL erro: {e}")
 
-# ── Estado global ───────────────────────────────────────────
 state = {
     "total_markets": 0,
     "total_snapshots": 0,
@@ -57,7 +56,6 @@ GAMMA = "https://gamma-api.polymarket.com"
 NTFY_TOPIC = "polysignal-matheus"
 alerted_slugs = set()
 
-# ── Ntfy ────────────────────────────────────────────────────
 def send_alert(title, message, tags="chart_with_upwards_trend"):
     try:
         requests.post(
@@ -74,7 +72,6 @@ def send_alert(title, message, tags="chart_with_upwards_trend"):
     except Exception as e:
         print(f"❌ Ntfy erro: {e}")
 
-# ── Coleta ──────────────────────────────────────────────────
 def fetch_all_markets():
     all_markets = []
     offset = 0
@@ -82,10 +79,8 @@ def fetch_all_markets():
     while True:
         try:
             r = requests.get(f"{GAMMA}/markets", params={
-                "active": True,
-                "closed": False,
-                "limit": limit,
-                "offset": offset,
+                "active": True, "closed": False,
+                "limit": limit, "offset": offset,
             }, timeout=15)
             data = r.json()
             if not data:
@@ -124,10 +119,12 @@ def parse_market(m, now):
         return None
 
     end_date_str = m.get("endDate", "")
+    days_to_close = None
     try:
         end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
         if end_date < now:
             return None
+        days_to_close = (end_date - now).days
     except Exception:
         return None
 
@@ -146,25 +143,21 @@ def parse_market(m, now):
         "volume": round(float(m.get("volume", 0) or 0), 2),
         "volume_24h": round(float(m.get("volume24hr", 0) or 0), 2),
         "end_date": end_date_str,
+        "days_to_close": days_to_close,
         "change_24h": change,
     }
 
 def save_snapshots(markets):
     if not Session:
-        print("❌ Session não existe")
         return
     try:
         session = Session()
         for m in markets:
             snap = Snapshot(
-                slug=m["slug"],
-                question=m["question"],
-                yes_price=m["yes_price"],
-                no_price=m["no_price"],
-                volume=m["volume"],
-                volume_24h=m["volume_24h"],
-                change_24h=m["change_24h"],
-                captured_at=datetime.utcnow(),
+                slug=m["slug"], question=m["question"],
+                yes_price=m["yes_price"], no_price=m["no_price"],
+                volume=m["volume"], volume_24h=m["volume_24h"],
+                change_24h=m["change_24h"], captured_at=datetime.utcnow(),
             )
             session.add(snap)
         session.commit()
@@ -173,42 +166,26 @@ def save_snapshots(markets):
         session.close()
         print(f"✅ Snapshots salvos: {result}")
     except Exception as e:
-        print(f"❌ Snapshot erro detalhado: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Snapshot erro: {e}")
 
 def check_alerts(markets):
     for m in markets:
         change = m.get("change_24h")
         volume_24h = m.get("volume_24h", 0)
         slug = m.get("slug", "")
-
-        if change is None:
+        if change is None or abs(change) < 0.05 or volume_24h < 5000 or slug in alerted_slugs:
             continue
-        if abs(change) < 0.05:
-            continue
-        if volume_24h < 5000:
-            continue
-        if slug in alerted_slugs:
-            continue
-
-        if change > 0:
-            sinal = "BUY"
-            acao = f"Compre YES a {m['yes_price']}%"
-            tags = "green_circle"
-        else:
-            sinal = "SELL"
-            acao = f"Compre NO a {m['no_price']}%"
-            tags = "red_circle"
-
+        sinal = "BUY" if change > 0 else "SELL"
+        acao = f"Compre YES a {m['yes_price']}%" if change > 0 else f"Compre NO a {m['no_price']}%"
+        tags = "green_circle" if change > 0 else "red_circle"
+        dias = m.get("days_to_close", "?")
         send_alert(
             f"PolySignal {sinal}",
-            f"{m['question']}\n\nAcao: {acao}\nVariacao 24h: {round(change*100,1)}%\nVol 24h: ${round(volume_24h/1000,1)}k\nKelly: ate 5% da banca",
+            f"{m['question']}\n\nAcao: {acao}\nVariacao 24h: {round(change*100,1)}%\nVol 24h: ${round(volume_24h/1000,1)}k\nFecha em: {dias} dias\nKelly: ate 5% da banca",
             tags=tags
         )
         alerted_slugs.add(slug)
 
-# ── Worker ──────────────────────────────────────────────────
 def worker_loop():
     print("🔄 Worker iniciado")
     while True:
@@ -222,7 +199,7 @@ def worker_loop():
             state["worker_healthy"] = True
             save_snapshots(markets)
             check_alerts(markets)
-            print(f"✅ {len(markets)} mercados coletados · {state['total_snapshots']} snapshots")
+            print(f"✅ {len(markets)} mercados · {state['total_snapshots']} snapshots")
         except Exception as e:
             state["worker_healthy"] = False
             print(f"❌ Worker erro: {e}")
@@ -233,7 +210,7 @@ threading.Thread(target=worker_loop, daemon=True).start()
 # ── Endpoints ────────────────────────────────────────────────
 @app.get("/")
 def home():
-    return {"status": "ok", "service": "PolySignal", "version": "2.0"}
+    return {"status": "ok", "service": "PolySignal", "version": "3.0"}
 
 @app.get("/status")
 def status():
@@ -248,22 +225,109 @@ def status():
     }
 
 @app.get("/markets")
-def get_markets():
+def get_markets(max_days: int = Query(default=0, description="Filtro de prazo em dias (0 = todos)")):
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
         markets = []
         for m in all_data:
             parsed = parse_market(m, now)
-            if parsed:
-                markets.append(parsed)
+            if not parsed:
+                continue
+            if max_days > 0 and (parsed["days_to_close"] is None or parsed["days_to_close"] > max_days):
+                continue
+            markets.append(parsed)
         markets.sort(key=lambda x: x["volume_24h"], reverse=True)
         return markets
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/closing_soon")
+def get_closing_soon(max_days: int = Query(default=7)):
+    """Mercados fechando em breve com sinal detectado — maior edge potencial"""
+    try:
+        now = datetime.now(timezone.utc)
+        all_data = fetch_all_markets()
+        results = []
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if not parsed:
+                continue
+
+            days = parsed["days_to_close"]
+            if days is None or days > max_days:
+                continue
+
+            change = parsed["change_24h"]
+            volume_24h = parsed["volume_24h"]
+            yes = parsed["yes_price"]
+
+            # Urgencia — mercados que fecham mais cedo tem mais peso
+            urgencia = max(0, 100 - (days * 14))
+
+            # Sinal de movimento
+            movimento = 0
+            direcao = None
+            if change is not None and abs(change) >= 0.005:
+                movimento = min(abs(change) * 300, 50)
+                direcao = "BUY" if change > 0 else "SELL"
+
+            # Volume relativo
+            vol_score = min((volume_24h / 5000) * 10, 20)
+
+            score = round(urgencia * 0.5 + movimento * 0.3 + vol_score * 0.2, 1)
+
+            if score < 10:
+                continue
+
+            if direcao == "BUY":
+                acao = f"Compre YES a {yes}%"
+                acao_cor = "#30d158"
+            elif direcao == "SELL":
+                acao = f"Compre NO a {parsed['no_price']}%"
+                acao_cor = "#ff453a"
+            else:
+                acao = f"Monitorar — sem sinal claro"
+                acao_cor = "#ff9f0a"
+
+            # Label de urgencia
+            if days == 0:
+                urgencia_label = "HOJE"
+                urgencia_cor = "#ff453a"
+            elif days == 1:
+                urgencia_label = "AMANHA"
+                urgencia_cor = "#ff453a"
+            elif days <= 3:
+                urgencia_label = f"{days} DIAS"
+                urgencia_cor = "#ff9f0a"
+            else:
+                urgencia_label = f"{days} DIAS"
+                urgencia_cor = "#0a84ff"
+
+            results.append({
+                "question": parsed["question"],
+                "slug": parsed["slug"],
+                "days_to_close": days,
+                "urgencia_label": urgencia_label,
+                "urgencia_cor": urgencia_cor,
+                "direcao": direcao,
+                "acao": acao,
+                "acao_cor": acao_cor,
+                "score": score,
+                "yes_price": yes,
+                "no_price": parsed["no_price"],
+                "change_24h": round(change * 100, 2) if change else 0,
+                "volume_24h": volume_24h,
+                "end_date": parsed["end_date"],
+            })
+
+        results.sort(key=lambda x: (x["days_to_close"], -x["score"]))
+        return results
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/signals")
-def get_signals():
+def get_signals(max_days: int = Query(default=0)):
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
@@ -272,30 +336,22 @@ def get_signals():
             parsed = parse_market(m, now)
             if not parsed:
                 continue
+            if max_days > 0 and (parsed["days_to_close"] is None or parsed["days_to_close"] > max_days):
+                continue
             change = parsed["change_24h"]
             volume_24h = parsed["volume_24h"]
-            if change is None:
-                continue
-            if abs(change) < 0.05:
-                continue
-            if volume_24h < 1000:
+            if change is None or abs(change) < 0.05 or volume_24h < 1000:
                 continue
             signal = "BUY" if change > 0 else "SELL"
             confidence = round(min(abs(change) * 200, 95) / 100, 2)
             p = parsed["yes_price"] / 100 if signal == "BUY" else parsed["no_price"] / 100
-            edge = abs(change)
-            kelly = round((edge / max(1 - p, 0.01)) * 0.25 * 100, 1)
-            kelly = min(kelly, 5.0)
+            kelly = min(round((abs(change) / max(1 - p, 0.01)) * 0.25 * 100, 1), 5.0)
             signals.append({
-                "question": parsed["question"],
-                "slug": parsed["slug"],
-                "signal": signal,
-                "yes_price": parsed["yes_price"],
-                "no_price": parsed["no_price"],
-                "change_24h": round(change * 100, 2),
-                "confidence": confidence,
-                "kelly": kelly,
-                "volume_24h": volume_24h,
+                "question": parsed["question"], "slug": parsed["slug"],
+                "signal": signal, "yes_price": parsed["yes_price"], "no_price": parsed["no_price"],
+                "change_24h": round(change * 100, 2), "confidence": confidence,
+                "kelly": kelly, "volume_24h": volume_24h,
+                "days_to_close": parsed["days_to_close"],
             })
         signals.sort(key=lambda x: abs(x["change_24h"]), reverse=True)
         return signals
@@ -303,41 +359,26 @@ def get_signals():
         return {"error": str(e)}
 
 @app.get("/recommendations")
-def get_recommendations():
-    """Motor #6 — Recomendacoes: combina sinais + anomalias + reversao num score composto"""
+def get_recommendations(max_days: int = Query(default=0)):
     if not Session:
         return {"error": "Banco nao conectado"}
     try:
         now = datetime.now(timezone.utc)
         all_data = fetch_all_markets()
-
-        # Busca historico do banco
         session = Session()
         rows = session.execute(text("""
-            SELECT slug,
-                   AVG(yes_price) as avg_yes,
-                   STDDEV(yes_price) as std_yes,
-                   AVG(volume_24h) as avg_vol,
-                   STDDEV(volume_24h) as std_vol,
-                   COUNT(*) as total_snaps
-            FROM snapshots
-            GROUP BY slug
-            HAVING COUNT(*) >= 5
+            SELECT slug, AVG(yes_price), STDDEV(yes_price), AVG(volume_24h), STDDEV(volume_24h), COUNT(*)
+            FROM snapshots GROUP BY slug HAVING COUNT(*) >= 5
         """)).fetchall()
         session.close()
-
-        historico = {r[0]: {
-            "avg_yes": r[1],
-            "std_yes": r[2] or 0,
-            "avg_vol": r[3] or 0,
-            "std_vol": r[4] or 0,
-            "total_snaps": r[5],
-        } for r in rows}
+        historico = {r[0]: {"avg_yes": r[1], "std_yes": r[2] or 0, "avg_vol": r[3] or 0, "std_vol": r[4] or 0, "total_snaps": r[5]} for r in rows}
 
         results = []
         for m in all_data:
             parsed = parse_market(m, now)
             if not parsed:
+                continue
+            if max_days > 0 and (parsed["days_to_close"] is None or parsed["days_to_close"] > max_days):
                 continue
 
             slug = parsed["slug"]
@@ -345,18 +386,17 @@ def get_recommendations():
             volume_24h = parsed["volume_24h"]
             yes = parsed["yes_price"]
             no = parsed["no_price"]
+            days = parsed["days_to_close"]
 
             if volume_24h < 1000:
                 continue
 
-            # ── Score de Sinal (Motor #1) ──
             sinal_score = 0
             sinal_dir = None
             if change is not None and abs(change) >= 0.01:
                 sinal_score = min(abs(change) * 200, 40)
                 sinal_dir = "BUY" if change > 0 else "SELL"
 
-            # ── Score de Anomalia + Reversao (Motores #2 e #3) ──
             anomalia_score = 0
             reversao_score = 0
             reversao_dir = None
@@ -368,92 +408,60 @@ def get_recommendations():
                 std_yes = h["std_yes"]
                 avg_vol = h["avg_vol"]
                 std_vol = h["std_vol"]
-
                 if avg_yes and std_yes > 0.5:
                     preco_zscore = (yes - avg_yes) / std_yes
                     vol_zscore = (volume_24h - avg_vol) / std_vol if std_vol > 100 else 0
-
-                    # Anomalia
-                    intensidade = min(abs(preco_zscore) * 15, 20)
-                    surpresa = min(abs(vol_zscore) * 10, 20)
-                    anomalia_score = round(intensidade + surpresa, 1)
-
-                    # Reversao
+                    anomalia_score = round(min(abs(preco_zscore) * 15, 20) + min(abs(vol_zscore) * 10, 20), 1)
                     desvio = yes - avg_yes
                     desvio_pct = abs((desvio / avg_yes) * 100) if avg_yes > 0 else 0
                     reversao_score = min(round(abs(preco_zscore) * 10 + desvio_pct, 1), 40)
                     reversao_dir = "SELL" if desvio > 0 else "BUY"
 
-            # ── Score composto final ──
-            # Sinal 40% + Anomalia 20% + Reversao 40%
-            score_total = round((sinal_score * 0.4) + (anomalia_score * 0.2) + (reversao_score * 0.4), 1)
+            # Bonus por prazo curto
+            prazo_bonus = 0
+            if days is not None:
+                if days <= 1: prazo_bonus = 20
+                elif days <= 3: prazo_bonus = 15
+                elif days <= 7: prazo_bonus = 10
+                elif days <= 30: prazo_bonus = 5
 
-            if score_total < 10:
+            score_total = round((sinal_score * 0.35) + (anomalia_score * 0.15) + (reversao_score * 0.35) + (prazo_bonus * 0.15), 1)
+
+            if score_total < 8:
                 continue
 
-            # ── Direcao final (consenso dos motores) ──
-            votos_buy = sum([
-                1 if sinal_dir == "BUY" else 0,
-                1 if reversao_dir == "BUY" else 0,
-            ])
-            votos_sell = sum([
-                1 if sinal_dir == "SELL" else 0,
-                1 if reversao_dir == "SELL" else 0,
-            ])
+            votos_buy = (1 if sinal_dir == "BUY" else 0) + (1 if reversao_dir == "BUY" else 0)
+            votos_sell = (1 if sinal_dir == "SELL" else 0) + (1 if reversao_dir == "SELL" else 0)
 
             if votos_buy > votos_sell:
-                direcao = "BUY"
-                direcao_cor = "#30d158"
-                entry_price = yes
-                acao = f"Compre YES a {yes}%"
-                p = yes / 100
+                direcao = "BUY"; direcao_cor = "#30d158"
+                acao = f"Compre YES a {yes}%"; p = yes / 100
             elif votos_sell > votos_buy:
-                direcao = "SELL"
-                direcao_cor = "#ff453a"
-                entry_price = no
-                acao = f"Compre NO a {no}%"
-                p = no / 100
+                direcao = "SELL"; direcao_cor = "#ff453a"
+                acao = f"Compre NO a {no}%"; p = no / 100
             else:
-                continue  # empate — sem recomendacao clara
+                continue
 
-            # ── Kelly ──
             edge = abs(change) if change else 0.01
-            kelly = round((edge / max(1 - p, 0.01)) * 0.25 * 100, 1)
-            kelly = min(kelly, 5.0)
+            kelly = min(round((edge / max(1 - p, 0.01)) * 0.25 * 100, 1), 5.0)
 
-            # ── Motores que confirmam ──
             motores = []
-            if sinal_dir == direcao:
-                motores.append("Sinal")
-            if reversao_dir == direcao:
-                motores.append("Reversao")
-            if anomalia_score > 15:
-                motores.append("Anomalia")
+            if sinal_dir == direcao: motores.append("Sinal")
+            if reversao_dir == direcao: motores.append("Reversao")
+            if anomalia_score > 15: motores.append("Anomalia")
+            if days is not None and days <= 7: motores.append("Prazo")
 
-            if score_total >= 60:
-                forca = "FORTE"
-            elif score_total >= 30:
-                forca = "MEDIA"
-            else:
-                forca = "FRACA"
+            forca = "FORTE" if score_total >= 60 else "MEDIA" if score_total >= 30 else "FRACA"
 
             results.append({
-                "question": parsed["question"],
-                "slug": slug,
-                "direcao": direcao,
-                "direcao_cor": direcao_cor,
-                "forca": forca,
-                "score_total": score_total,
-                "sinal_score": round(sinal_score, 1),
-                "anomalia_score": anomalia_score,
-                "reversao_score": reversao_score,
-                "kelly": kelly,
-                "acao": acao,
-                "entry_price": entry_price,
-                "yes_price": yes,
-                "no_price": no,
+                "question": parsed["question"], "slug": slug,
+                "direcao": direcao, "direcao_cor": direcao_cor, "forca": forca,
+                "score_total": score_total, "sinal_score": round(sinal_score, 1),
+                "anomalia_score": anomalia_score, "reversao_score": reversao_score,
+                "prazo_bonus": prazo_bonus, "kelly": kelly, "acao": acao,
+                "yes_price": yes, "no_price": no,
                 "change_24h": round(change * 100, 2) if change else 0,
-                "volume_24h": volume_24h,
+                "volume_24h": volume_24h, "days_to_close": days,
                 "motores": motores,
                 "yes_price_media": round(avg_yes, 1) if avg_yes else None,
             })
@@ -464,8 +472,7 @@ def get_recommendations():
         return {"error": str(e)}
 
 @app.get("/anomalies")
-def get_anomalies():
-    """Motor #2 — Anomalias: detecta comportamento anormal vs historico do banco"""
+def get_anomalies(max_days: int = Query(default=0)):
     if not Session:
         return {"error": "Banco nao conectado"}
     try:
@@ -473,29 +480,18 @@ def get_anomalies():
         all_data = fetch_all_markets()
         session = Session()
         rows = session.execute(text("""
-            SELECT slug,
-                   AVG(yes_price) as avg_yes,
-                   STDDEV(yes_price) as std_yes,
-                   AVG(volume_24h) as avg_vol,
-                   STDDEV(volume_24h) as std_vol,
-                   COUNT(*) as total_snaps,
-                   MAX(captured_at) as last_snap
-            FROM snapshots
-            GROUP BY slug
-            HAVING COUNT(*) >= 10
+            SELECT slug, AVG(yes_price), STDDEV(yes_price), AVG(volume_24h), STDDEV(volume_24h), COUNT(*), MAX(captured_at)
+            FROM snapshots GROUP BY slug HAVING COUNT(*) >= 10
         """)).fetchall()
         session.close()
-
-        historico = {r[0]: {
-            "avg_yes": r[1], "std_yes": r[2] or 0,
-            "avg_vol": r[3] or 0, "std_vol": r[4] or 0,
-            "total_snaps": r[5], "last_snap": r[6],
-        } for r in rows}
+        historico = {r[0]: {"avg_yes": r[1], "std_yes": r[2] or 0, "avg_vol": r[3] or 0, "std_vol": r[4] or 0, "total_snaps": r[5]} for r in rows}
 
         results = []
         for m in all_data:
             parsed = parse_market(m, now)
             if not parsed:
+                continue
+            if max_days > 0 and (parsed["days_to_close"] is None or parsed["days_to_close"] > max_days):
                 continue
             slug = parsed["slug"]
             if slug not in historico:
@@ -512,10 +508,7 @@ def get_anomalies():
             preco_zscore = round((current_yes - avg_yes) / std_yes, 2) if std_yes > 0.5 else 0
             preco_desvio = round(((current_yes - avg_yes) / avg_yes) * 100, 1) if avg_yes > 0 else 0
             vol_zscore = round((current_vol - avg_vol) / std_vol, 2) if std_vol > 100 else 0
-            intensidade = min(abs(preco_zscore) * 25, 40)
-            surpresa = min(abs(vol_zscore) * 15, 30)
-            confirmacao = 30 if (abs(preco_zscore) > 1 and abs(vol_zscore) > 1) else 0
-            anomaly_score = round(intensidade + surpresa + confirmacao, 1)
+            anomaly_score = round(min(abs(preco_zscore) * 25, 40) + min(abs(vol_zscore) * 15, 30) + (30 if abs(preco_zscore) > 1 and abs(vol_zscore) > 1 else 0), 1)
             if anomaly_score < 15:
                 continue
             if preco_zscore > 1.5 and vol_zscore > 1:
@@ -529,7 +522,7 @@ def get_anomalies():
                 interpretacao = "Preco muito distante da media historica — possivel mispricing"
             elif vol_zscore > 2:
                 tipo = "VOLUME ANORMAL"; tipo_cor = "#bf5af2"
-                interpretacao = "Volume muito acima do normal — atividade suspeita ou evento relevante"
+                interpretacao = "Volume muito acima do normal — atividade suspeita"
             else:
                 tipo = "ANOMALIA"; tipo_cor = "#0a84ff"
                 interpretacao = "Comportamento fora do padrao historico"
@@ -544,6 +537,7 @@ def get_anomalies():
                 "vol_zscore": vol_zscore, "total_snaps": h["total_snaps"],
                 "interpretacao": interpretacao,
                 "yes_price": parsed["yes_price"], "no_price": parsed["no_price"],
+                "days_to_close": parsed["days_to_close"],
             })
         results.sort(key=lambda x: x["anomaly_score"], reverse=True)
         return results[:20]
@@ -551,8 +545,7 @@ def get_anomalies():
         return {"error": str(e)}
 
 @app.get("/reversion")
-def get_reversion():
-    """Motor #3 — Reversao a Media"""
+def get_reversion(max_days: int = Query(default=0)):
     if not Session:
         return {"error": "Banco nao conectado"}
     try:
@@ -570,6 +563,8 @@ def get_reversion():
             parsed = parse_market(m, now)
             if not parsed:
                 continue
+            if max_days > 0 and (parsed["days_to_close"] is None or parsed["days_to_close"] > max_days):
+                continue
             slug = parsed["slug"]
             if slug not in historico:
                 continue
@@ -582,14 +577,10 @@ def get_reversion():
             zscore = round(desvio / std, 2) if std > 1 else 0
             if abs(desvio_pct) < 3 and abs(zscore) < 1:
                 continue
-            if desvio > 0:
-                direcao = "SELL"; direcao_cor = "#ff453a"
-                interpretacao = f"Preco {desvio_pct:.1f}% acima da media historica — possivel reversao para baixo"
-                acao = f"Compre NO a {parsed['no_price']}%"
-            else:
-                direcao = "BUY"; direcao_cor = "#30d158"
-                interpretacao = f"Preco {abs(desvio_pct):.1f}% abaixo da media historica — possivel reversao para cima"
-                acao = f"Compre YES a {parsed['yes_price']}%"
+            direcao = "SELL" if desvio > 0 else "BUY"
+            direcao_cor = "#ff453a" if desvio > 0 else "#30d158"
+            interpretacao = f"Preco {desvio_pct:.1f}% acima da media" if desvio > 0 else f"Preco {abs(desvio_pct):.1f}% abaixo da media"
+            acao = f"Compre NO a {parsed['no_price']}%" if desvio > 0 else f"Compre YES a {parsed['yes_price']}%"
             score = min(round(abs(zscore) * 25 + abs(desvio_pct) * 2, 1), 100)
             forca = "FORTE" if score >= 60 else "MEDIA" if score >= 30 else "FRACA"
             results.append({
@@ -600,87 +591,10 @@ def get_reversion():
                 "desvio_pct": desvio_pct, "zscore": zscore, "total_snaps": h["total_snaps"],
                 "interpretacao": interpretacao, "acao": acao,
                 "volume_24h": parsed["volume_24h"], "no_price": parsed["no_price"],
+                "days_to_close": parsed["days_to_close"],
             })
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:20]
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/orphans")
-def get_orphans():
-    try:
-        now = datetime.now(timezone.utc)
-        all_data = fetch_all_markets()
-        orphans = []
-        for m in all_data:
-            parsed = parse_market(m, now)
-            if not parsed:
-                continue
-            volume_24h = parsed["volume_24h"]; volume = parsed["volume"]; change = parsed["change_24h"]
-            if volume > 50000 or volume_24h > 5000:
-                continue
-            ineficiencia = max(0, min(100, round(100 - (volume / 500), 1)))
-            yes = parsed["yes_price"]
-            orphans.append({
-                "question": parsed["question"], "slug": parsed["slug"],
-                "yes_price": yes, "no_price": parsed["no_price"],
-                "volume": volume, "volume_24h": volume_24h,
-                "change_24h": round(change * 100, 2) if change else 0,
-                "ineficiencia_score": ineficiencia,
-                "distancia_50": round(abs(yes - 50), 1),
-                "tier": "orfao" if volume < 10000 else "niche",
-            })
-        orphans.sort(key=lambda x: x["ineficiencia_score"], reverse=True)
-        return orphans[:30]
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/narrative")
-def get_narrative():
-    try:
-        now = datetime.now(timezone.utc)
-        all_data = fetch_all_markets()
-        results = []
-        for m in all_data:
-            parsed = parse_market(m, now)
-            if not parsed:
-                continue
-            change = parsed["change_24h"]; volume_24h = parsed["volume_24h"]
-            if change is None or volume_24h < 1000:
-                continue
-            abs_change = abs(change)
-            direction = "BULLISH" if change > 0 else "BEARISH"
-            momentum = min(round(abs_change * 300, 1), 100)
-            yes = parsed["yes_price"]
-            convicao = round(abs(yes - 50) * 2, 1)
-            vol_score = min(round((volume_24h / 10000) * 10, 1), 30)
-            narrative_score = round((momentum * 0.5) + (convicao * 0.3) + (vol_score * 0.2), 1)
-            if narrative_score < 15:
-                continue
-            if narrative_score >= 65:
-                forca = "FORTE"; forca_color = "#30d158"
-            elif narrative_score >= 35:
-                forca = "MEDIA"; forca_color = "#ff9f0a"
-            else:
-                forca = "FRACA"; forca_color = "#ff453a"
-            if direction == "BULLISH" and forca == "FORTE":
-                interpretacao = "Narrativa bullish consolidada — momentum favorece YES"
-            elif direction == "BEARISH" and forca == "FORTE":
-                interpretacao = "Narrativa bearish consolidada — momentum favorece NO"
-            elif forca == "MEDIA":
-                interpretacao = "Narrativa em formacao — aguardar confirmacao"
-            else:
-                interpretacao = "Sinal fraco — ruido provavel"
-            results.append({
-                "question": parsed["question"], "slug": parsed["slug"],
-                "direction": direction, "forca": forca, "forca_color": forca_color,
-                "narrative_score": narrative_score, "momentum": momentum, "convicao": convicao,
-                "interpretacao": interpretacao,
-                "yes_price": parsed["yes_price"], "no_price": parsed["no_price"],
-                "change_24h": round(change * 100, 2), "volume_24h": volume_24h,
-            })
-        results.sort(key=lambda x: x["narrative_score"], reverse=True)
-        return results[:25]
     except Exception as e:
         return {"error": str(e)}
 
