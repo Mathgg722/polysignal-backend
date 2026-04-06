@@ -827,3 +827,192 @@ def get_kalshi():
         return markets
     except Exception as e:
         return {"error": str(e)}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PATCH — Adicionar no FINAL do main.py (antes do último endpoint /kalshi ou depois)
+# Motor #52 — GTI (Global Tension Index)
+# Motor — Shannon Entropy (Detector de Regime)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import math
+
+# ── Mapa de mercados geopolíticos e peso de tensão ───────────────────────────
+GEO_SIGNALS = [
+    # (keywords no slug/question, peso, "tensao se YES alto" ou "tensao se NO alto")
+    {"keywords": ["russia", "ukraine", "ceasefire"],     "weight": 15, "tension_if": "NO"},   # sem cessar-fogo = tensão
+    {"keywords": ["china", "invade", "taiwan"],          "weight": 20, "tension_if": "YES"},  # invasão = tensão
+    {"keywords": ["putin", "out"],                       "weight": 8,  "tension_if": "YES"},  # Putin cai = instabilidade
+    {"keywords": ["netanyahu", "out"],                   "weight": 8,  "tension_if": "YES"},
+    {"keywords": ["zelenskyy", "out"],                   "weight": 8,  "tension_if": "YES"},
+    {"keywords": ["erdogan", "out"],                     "weight": 6,  "tension_if": "YES"},
+    {"keywords": ["xi", "jinping", "out"],               "weight": 10, "tension_if": "YES"},
+    {"keywords": ["war", "invad", "militar"],            "weight": 10, "tension_if": "YES"},
+    {"keywords": ["trump", "impeach"],                   "weight": 5,  "tension_if": "YES"},
+    {"keywords": ["nuclear"],                            "weight": 15, "tension_if": "YES"},
+    {"keywords": ["recession", "recessao"],              "weight": 8,  "tension_if": "YES"},
+    {"keywords": ["bitcoin", "btc", "crypto"],           "weight": 3,  "tension_if": "NO"},   # cripto caindo = tensão macro
+]
+
+def compute_gti(markets: list) -> dict:
+    """
+    Motor #52 — Global Tension Index
+    Score 0-100 de tensão geopolítica global baseado nos mercados Polymarket ativos.
+    """
+    total_weight  = 0
+    tension_score = 0
+    contributors  = []
+
+    for m in markets:
+        q    = (m.get("question", "") + " " + m.get("slug", "")).lower()
+        yes  = m.get("yes_price", 50)
+        no   = m.get("no_price",  50)
+
+        for sig in GEO_SIGNALS:
+            if not all(kw in q for kw in sig["keywords"]):
+                continue
+
+            weight = sig["weight"]
+            total_weight += weight
+
+            # qual probabilidade representa tensão?
+            if sig["tension_if"] == "YES":
+                tension_prob = yes / 100
+            else:
+                tension_prob = no / 100
+
+            contribution = weight * tension_prob
+            tension_score += contribution
+
+            contributors.append({
+                "question":      m["question"],
+                "slug":          m.get("slug", ""),
+                "tension_prob":  round(tension_prob * 100, 1),
+                "weight":        weight,
+                "contribution":  round(contribution, 1),
+                "yes_price":     yes,
+                "no_price":      no,
+            })
+            break  # um mercado só conta uma vez
+
+    if total_weight == 0:
+        gti = 50  # sem dados = neutro
+    else:
+        gti = round((tension_score / total_weight) * 100, 1)
+
+    # classificação
+    if gti >= 75:
+        nivel = "CRÍTICO";  cor = "#ff453a"; acao = "Kill Switch — Kelly mínimo em tudo"
+    elif gti >= 60:
+        nivel = "ALTO";     cor = "#ff9f0a"; acao = "Reduzir sizing — favorece mercados doom"
+    elif gti >= 40:
+        nivel = "MÉDIO";    cor = "#ffd60a"; acao = "Operar normalmente com cautela"
+    elif gti >= 25:
+        nivel = "BAIXO";    cor = "#30d158"; acao = "Sizing normal — economia estável"
+    else:
+        nivel = "MÍNIMO";   cor = "#0a84ff"; acao = "Máxima agressividade — ambiente favorável"
+
+    contributors.sort(key=lambda x: x["contribution"], reverse=True)
+
+    return {
+        "gti":          gti,
+        "nivel":        nivel,
+        "cor":          cor,
+        "acao":         acao,
+        "total_weight": total_weight,
+        "contributors": contributors[:10],
+        "mercados_geo": len(contributors),
+        "timestamp":    datetime.utcnow().isoformat(),
+    }
+
+def compute_entropy(markets: list) -> dict:
+    """
+    Entropia de Shannon — Detector de Regime (dossiê seção 2.2)
+    H = -p*log2(p) - (1-p)*log2(1-p)
+    Máx = 1.0 bit (mercado 50/50 = máxima incerteza)
+    Mín = 0.0 bits (mercado resolvido = certeza total)
+    """
+    if not markets:
+        return {"error": "Sem mercados"}
+
+    entropies = []
+    for m in markets:
+        p = m.get("yes_price", 50) / 100
+        q = 1 - p
+        if p <= 0 or p >= 1:
+            h = 0.0
+        else:
+            h = -p * math.log2(p) - q * math.log2(q)
+        entropies.append({
+            "question":  m["question"],
+            "slug":      m.get("slug", ""),
+            "yes_price": m.get("yes_price"),
+            "entropy":   round(h, 4),
+        })
+
+    avg_entropy = round(sum(e["entropy"] for e in entropies) / len(entropies), 4)
+
+    # regime
+    if avg_entropy >= 0.92:
+        regime = "CAOS";           cor = "#ff453a"; kelly_mult = 0.0
+        descricao = "Mercado em máxima incerteza. Zero novas posições."
+    elif avg_entropy >= 0.80:
+        regime = "LATERAL";        cor = "#ff9f0a"; kelly_mult = 0.5
+        descricao = "Mercado indeciso. Kelly 50% — posições reduzidas."
+    elif avg_entropy >= 0.65:
+        regime = "TENDÊNCIA FRACA";cor = "#ffd60a"; kelly_mult = 0.75
+        descricao = "Alguma direção detectável. Kelly 75%."
+    else:
+        regime = "TENDÊNCIA FORTE";cor = "#30d158"; kelly_mult = 1.0
+        descricao = "Mercado com direção clara. Kelly cheio."
+
+    # mercados mais incertos (próximos de 50/50)
+    mais_incertos = sorted(entropies, key=lambda x: x["entropy"], reverse=True)[:5]
+    # mercados mais resolvidos (próximos de 0 ou 1)
+    mais_resolvidos = sorted(entropies, key=lambda x: x["entropy"])[:5]
+
+    return {
+        "avg_entropy":    avg_entropy,
+        "max_entropy":    1.0,
+        "regime":         regime,
+        "cor":            cor,
+        "kelly_mult":     kelly_mult,
+        "descricao":      descricao,
+        "total_mercados": len(entropies),
+        "mais_incertos":  mais_incertos,
+        "mais_resolvidos":mais_resolvidos,
+        "timestamp":      datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/gti")
+def get_gti():
+    """
+    Motor #52 — Global Tension Index
+    Score 0-100 de tensão geopolítica global.
+    Baseado nos mercados geopolíticos ativos no Polymarket.
+    """
+    try:
+        now      = datetime.now(timezone.utc)
+        all_data = fetch_all_markets()
+        markets  = [parse_market(m, now) for m in all_data]
+        markets  = [m for m in markets if m]
+        return compute_gti(markets)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/entropy")
+def get_entropy():
+    """
+    Entropia de Shannon — Detector de Regime de Mercado
+    Alta entropia = caos = não operar
+    Baixa entropia = tendência = operar com confiança
+    """
+    try:
+        now      = datetime.now(timezone.utc)
+        all_data = fetch_all_markets()
+        markets  = [parse_market(m, now) for m in all_data]
+        markets  = [m for m in markets if m]
+        return compute_entropy(markets)
+    except Exception as e:
+        return {"error": str(e)}
