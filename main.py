@@ -1016,3 +1016,156 @@ def get_entropy():
         return compute_entropy(markets)
     except Exception as e:
         return {"error": str(e)}
+    
+# ═══════════════════════════════════════════════════════════════════════════════
+# PATCH — Adicionar no FINAL do main.py
+# Motor #56 — Polymarket Seismograph
+# Detecta micro-tremores antes de grandes movimentos
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/seismograph")
+def get_seismograph(
+    min_snaps:  int   = Query(default=10),
+    top:        int   = Query(default=20),
+    max_volume: int   = Query(default=0),
+):
+    """
+    Motor #56 — Polymarket Seismograph
+    Detecta micro-tremores: mercados que ficaram estáveis e começaram a se mover.
+    Usa os snapshots históricos do banco — quanto mais snapshots, mais preciso.
+
+    Métricas calculadas:
+    - velocity:     taxa de mudança média por snapshot (pontos percentuais/snap)
+    - acceleration: se a velocidade está aumentando (tremor se intensificando)
+    - stability:    quão estável o mercado ficou antes do tremor
+    - quake_score:  score final 0-100
+    """
+    if not Session:
+        return {"error": "Banco nao conectado"}
+    try:
+        now     = datetime.now(timezone.utc)
+        session = Session()
+
+        # busca últimos snapshots por mercado
+        rows = session.execute(text("""
+            SELECT
+                slug,
+                yes_price,
+                captured_at,
+                ROW_NUMBER() OVER (PARTITION BY slug ORDER BY captured_at DESC) as rn
+            FROM snapshots
+            WHERE captured_at >= NOW() - INTERVAL '24 hours'
+            ORDER BY slug, captured_at DESC
+        """)).fetchall()
+        session.close()
+
+        # agrupa por slug
+        from collections import defaultdict
+        slug_snaps = defaultdict(list)
+        for slug, yes_price, captured_at, rn in rows:
+            slug_snaps[slug].append({"yes_price": yes_price, "captured_at": captured_at})
+
+        # busca mercados ativos
+        all_data = fetch_all_markets()
+        market_map = {}
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if parsed:
+                market_map[parsed["slug"]] = parsed
+
+        results = []
+
+        for slug, snaps in slug_snaps.items():
+            if len(snaps) < min_snaps:
+                continue
+            if slug not in market_map:
+                continue
+
+            market = market_map[slug]
+            if max_volume > 0 and market.get("volume", 0) > max_volume:
+                continue
+
+            # ordena por tempo (mais antigo primeiro)
+            snaps_sorted = sorted(snaps, key=lambda x: x["captured_at"])
+            prices = [s["yes_price"] for s in snaps_sorted]
+
+            # divide em duas metades: passado vs recente
+            mid = len(prices) // 2
+            past_prices   = prices[:mid]
+            recent_prices = prices[mid:]
+
+            if not past_prices or not recent_prices:
+                continue
+
+            # estabilidade no passado (baixo desvio = mercado estava parado)
+            past_mean = sum(past_prices) / len(past_prices)
+            past_std  = (sum((p - past_mean) ** 2 for p in past_prices) / len(past_prices)) ** 0.5
+
+            # velocidade recente (mudança média por snapshot)
+            recent_changes = [abs(recent_prices[i] - recent_prices[i-1]) for i in range(1, len(recent_prices))]
+            velocity = sum(recent_changes) / len(recent_changes) if recent_changes else 0
+
+            # direção dominante
+            direction_changes = [recent_prices[i] - recent_prices[i-1] for i in range(1, len(recent_prices))]
+            net_direction = sum(direction_changes)
+
+            # aceleração: velocidade da segunda metade vs primeira metade do período recente
+            half = len(recent_changes) // 2
+            if half > 0:
+                v_early = sum(recent_changes[:half]) / half
+                v_late  = sum(recent_changes[half:]) / max(len(recent_changes[half:]), 1)
+                acceleration = v_late - v_early
+            else:
+                acceleration = 0
+
+            # quake score: alta velocidade + baixa estabilidade anterior + aceleração positiva
+            stability_bonus = max(0, 2.0 - past_std) * 10  # mercado mais estável antes = mais suspeito agora
+            velocity_score  = min(velocity * 40, 50)
+            accel_score     = min(max(acceleration * 30, 0), 30)
+            quake_score     = round(velocity_score + accel_score + stability_bonus, 1)
+
+            if quake_score < 5:
+                continue
+
+            # classificação
+            if quake_score >= 60:
+                nivel = "TERREMOTO"; cor = "#ff453a"
+            elif quake_score >= 35:
+                nivel = "TREMOR FORTE"; cor = "#ff9f0a"
+            elif quake_score >= 15:
+                nivel = "MICRO-TREMOR"; cor = "#ffd60a"
+            else:
+                nivel = "RUÍDO"; cor = "rgba(255,255,255,0.3)"
+
+            direcao = "↑ SUBINDO" if net_direction > 0.5 else ("↓ CAINDO" if net_direction < -0.5 else "→ LATERAL")
+            direcao_cor = "#30d158" if net_direction > 0.5 else ("#ff453a" if net_direction < -0.5 else "#ff9f0a")
+            signal = "BUY" if net_direction > 0.5 else ("SELL" if net_direction < -0.5 else "HOLD")
+
+            results.append({
+                "question":      market["question"],
+                "slug":          slug,
+                "yes_price":     market["yes_price"],
+                "no_price":      market["no_price"],
+                "quake_score":   quake_score,
+                "nivel":         nivel,
+                "cor":           cor,
+                "velocity":      round(velocity, 3),
+                "acceleration":  round(acceleration, 3),
+                "past_std":      round(past_std, 3),
+                "net_direction": round(net_direction, 2),
+                "direcao":       direcao,
+                "direcao_cor":   direcao_cor,
+                "signal":        signal,
+                "total_snaps":   len(snaps),
+                "volume_24h":    market.get("volume_24h", 0),
+                "days_to_close": market.get("days_to_close"),
+                "tier":          market.get("tier"),
+                "tier_label":    market.get("tier_label"),
+            })
+
+        results.sort(key=lambda x: x["quake_score"], reverse=True)
+        return results[:top]
+
+    except Exception as e:
+        return {"error": str(e)}
