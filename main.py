@@ -598,6 +598,49 @@ def get_reversion(max_days: int = Query(default=0)):
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/history/{slug}")
+def get_history(slug: str, hours: int = Query(default=24)):
+    """Historico de preco de um mercado pelo banco de snapshots"""
+    if not Session:
+        return {"error": "Banco nao conectado"}
+    try:
+        session = Session()
+        rows = session.execute(text("""
+            SELECT yes_price, no_price, volume_24h, captured_at
+            FROM snapshots
+            WHERE slug = :slug
+            ORDER BY captured_at ASC
+            LIMIT 500
+        """), {"slug": slug}).fetchall()
+        session.close()
+
+        points = [{
+            "yes_price": r[0],
+            "no_price": r[1],
+            "volume_24h": r[2],
+            "time": r[3].isoformat() if r[3] else None,
+        } for r in rows]
+
+        if not points:
+            return {"slug": slug, "points": [], "total": 0}
+
+        first = points[0]["yes_price"]
+        last = points[-1]["yes_price"]
+        change = round(last - first, 1)
+        change_pct = round((change / first) * 100, 2) if first > 0 else 0
+
+        return {
+            "slug": slug,
+            "points": points,
+            "total": len(points),
+            "yes_first": first,
+            "yes_last": last,
+            "change": change,
+            "change_pct": change_pct,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/kalshi")
 def get_kalshi():
     try:
