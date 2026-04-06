@@ -1169,3 +1169,200 @@ def get_seismograph(
 
     except Exception as e:
         return {"error": str(e)}
+    
+# ═══════════════════════════════════════════════════════════════════════════════
+# PATCH — Adicionar no FINAL do main.py
+# Motor #48 — Detector de Resolução Especial
+# Identifica pegadinhas e cláusulas especiais antes de apostar
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Padrões de risco nas regras de resolução
+RESOLUTION_RISKS = [
+    # (padrão, nível, descrição do risco)
+    {"pattern": ["50-50", "50/50", "split evenly", "divided equally"],
+     "level": "ARMADILHA", "cor": "#ff453a",
+     "risco": "Resolve 50-50 se o evento não ocorrer — não há vencedor claro"},
+    {"pattern": ["n/a", "resolve n/a", "resolves n/a"],
+     "level": "ARMADILHA", "cor": "#ff453a",
+     "risco": "Pode resolver como N/A — apostas devolvidas sem lucro"},
+    {"pattern": ["early access", "early release", "demo version", "beta"],
+     "level": "ARMADILHA", "cor": "#ff453a",
+     "risco": "Early access / demo NÃO conta para resolução — só lançamento oficial"},
+    {"pattern": ["unless officially", "unless announced", "unless confirmed"],
+     "level": "ATENÇÃO", "cor": "#ff9f0a",
+     "risco": "Requer confirmação oficial — rumores e leaks não resolvem"},
+    {"pattern": ["void if", "cancelled if", "voided"],
+     "level": "ATENÇÃO", "cor": "#ff9f0a",
+     "risco": "Mercado pode ser anulado em certas condições"},
+    {"pattern": ["at least", "minimum of", "no less than"],
+     "level": "ATENÇÃO", "cor": "#ff9f0a",
+     "risco": "Resolução com threshold mínimo — leia o critério exato"},
+    {"pattern": ["primary source", "official source only", "official announcement only"],
+     "level": "ATENÇÃO", "cor": "#ff9f0a",
+     "risco": "Só fonte oficial conta — reportagens secundárias não resolvem"},
+    {"pattern": ["before gta", "before gta vi", "gta vi release"],
+     "level": "ATENÇÃO", "cor": "#ff9f0a",
+     "risco": "Dependente da data de lançamento do GTA VI — incerta"},
+    {"pattern": ["as president", "while serving", "in office"],
+     "level": "ATENÇÃO", "cor": "#ff9f0a",
+     "risco": "Resolução vinculada ao mandato — mudanças políticas afetam"},
+    {"pattern": ["per polymarket", "at polymarket's discretion", "polymarket will determine"],
+     "level": "ATENÇÃO", "cor": "#ff9f0a",
+     "risco": "Resolução discricionária — Polymarket decide o critério final"},
+]
+
+def analyze_resolution(question: str, description: str, yes_price: float, no_price: float) -> dict:
+    """Analisa as regras de resolução e detecta riscos."""
+    text = (description or "").lower()
+    q    = question.lower()
+
+    risks_found = []
+    max_level   = "SEGURO"
+    level_order = {"SEGURO": 0, "ATENÇÃO": 1, "ARMADILHA": 2}
+
+    for risk in RESOLUTION_RISKS:
+        if any(p in text for p in risk["pattern"]):
+            risks_found.append({
+                "risco":  risk["risco"],
+                "level":  risk["level"],
+                "cor":    risk["cor"],
+            })
+            if level_order[risk["level"]] > level_order[max_level]:
+                max_level = risk["level"]
+
+    # o que precisa ser verdade pra cada lado
+    if yes_price >= 50:
+        yes_tese = f"Você acredita que SIM ({yes_price}%) — o evento vai acontecer"
+        no_tese  = f"Você acredita que NÃO ({no_price}%) — o evento NÃO vai acontecer"
+    else:
+        yes_tese = f"Você acredita que SIM ({yes_price}%) — aposta contrária, evento é improvável"
+        no_tese  = f"Você acredita que NÃO ({no_price}%) — o evento vai acontecer"
+
+    cor_nivel = {"SEGURO": "#30d158", "ATENÇÃO": "#ff9f0a", "ARMADILHA": "#ff453a"}
+
+    return {
+        "nivel":        max_level,
+        "cor":          cor_nivel[max_level],
+        "risks":        risks_found,
+        "total_riscos": len(risks_found),
+        "yes_tese":     yes_tese,
+        "no_tese":      no_tese,
+        "tem_descricao": bool(description and len(description) > 20),
+        "descricao_resumo": description[:300] if description else None,
+    }
+
+
+@app.get("/resolution")
+def get_resolution(
+    max_days:   int = Query(default=90),
+    nivel:      str = Query(default=""),  # filtrar por SEGURO, ATENÇÃO, ARMADILHA
+    top:        int = Query(default=30),
+):
+    """
+    Motor #48 — Detector de Resolução Especial
+    Analisa as regras de cada mercado e identifica pegadinhas.
+    Retorna o que o trader precisa acreditar pra lucrar em cada lado.
+    """
+    try:
+        now      = datetime.now(timezone.utc)
+        results  = []
+        offset   = 0
+        limit    = 100
+
+        while True:
+            try:
+                r = requests.get(f"{GAMMA}/markets", params={
+                    "active": True, "closed": False,
+                    "limit": limit, "offset": offset,
+                }, timeout=15)
+                data = r.json()
+                if not data:
+                    break
+
+                for m in data:
+                    parsed = parse_market(m, now)
+                    if not parsed:
+                        continue
+                    if max_days > 0 and (parsed["days_to_close"] is None or parsed["days_to_close"] > max_days):
+                        continue
+
+                    description = m.get("description", "") or m.get("rules", "") or ""
+                    analysis    = analyze_resolution(
+                        parsed["question"], description,
+                        parsed["yes_price"], parsed["no_price"]
+                    )
+
+                    if nivel and analysis["nivel"] != nivel:
+                        continue
+
+                    results.append({
+                        "question":       parsed["question"],
+                        "slug":           parsed["slug"],
+                        "yes_price":      parsed["yes_price"],
+                        "no_price":       parsed["no_price"],
+                        "days_to_close":  parsed["days_to_close"],
+                        "volume_24h":     parsed["volume_24h"],
+                        "tier":           parsed.get("tier"),
+                        "tier_label":     parsed.get("tier_label"),
+                        "resolution":     analysis,
+                    })
+
+                if len(data) < limit:
+                    break
+                offset += limit
+                if offset > 300:
+                    break
+            except Exception:
+                break
+
+        # ordena: armadilhas primeiro, depois atenção, depois seguros
+        level_order = {"ARMADILHA": 0, "ATENÇÃO": 1, "SEGURO": 2}
+        results.sort(key=lambda x: (level_order.get(x["resolution"]["nivel"], 3), -x["volume_24h"]))
+        return results[:top]
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/resolution/{slug}")
+def get_resolution_by_slug(slug: str):
+    """
+    Analisa as regras de resolução de um mercado específico.
+    Use antes de apostar para entender exatamente o que resolve YES ou NO.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        # busca mercado específico
+        r = requests.get(f"{GAMMA}/markets", params={
+            "active": True, "closed": False, "slug": slug, "limit": 1
+        }, timeout=10)
+        data = r.json()
+
+        if not data:
+            return {"error": "Mercado não encontrado"}
+
+        m      = data[0]
+        parsed = parse_market(m, now)
+        if not parsed:
+            return {"error": "Mercado inválido ou fechado"}
+
+        description = m.get("description", "") or m.get("rules", "") or ""
+        analysis    = analyze_resolution(
+            parsed["question"], description,
+            parsed["yes_price"], parsed["no_price"]
+        )
+
+        return {
+            "question":      parsed["question"],
+            "slug":          slug,
+            "yes_price":     parsed["yes_price"],
+            "no_price":      parsed["no_price"],
+            "days_to_close": parsed["days_to_close"],
+            "end_date":      parsed["end_date"],
+            "volume_24h":    parsed["volume_24h"],
+            "description":   description,
+            "resolution":    analysis,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
