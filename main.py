@@ -1747,3 +1747,245 @@ def get_resolution_by_slug(slug: str):
 
     except Exception as e:
         return {"error": str(e)}
+    
+# ═══════════════════════════════════════════════════════════════════════════════
+# PATCH — Adicionar no FINAL do main.py
+# Motor #36 — Pânico vs Euforia
+# Motor #37 — Velocidade de Movimento
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/panico")
+def get_panico(
+    min_snaps: int = Query(default=8),
+    top:       int = Query(default=20),
+):
+    """
+    Motor #36 — Pânico vs Euforia
+    Detecta regimes irracionais: quedas aceleradas sem fundamento (pânico)
+    ou subidas rápidas sem catalisador (euforia).
+    Pânico = oportunidade de fade (comprar o exagero para baixo).
+    Euforia = oportunidade de venda (o mercado exagerou para cima).
+    """
+    if not Session:
+        return {"error": "Banco nao conectado"}
+    try:
+        now     = datetime.now(timezone.utc)
+        session = Session()
+
+        rows = session.execute(text("""
+            SELECT slug, yes_price, captured_at
+            FROM snapshots
+            WHERE captured_at >= NOW() - INTERVAL '6 hours'
+            ORDER BY slug, captured_at ASC
+        """)).fetchall()
+        session.close()
+
+        from collections import defaultdict
+        slug_snaps = defaultdict(list)
+        for slug, yes_price, captured_at in rows:
+            slug_snaps[slug].append({"p": yes_price, "t": captured_at})
+
+        all_data   = fetch_all_markets()
+        market_map = {}
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if parsed:
+                market_map[parsed["slug"]] = parsed
+
+        results = []
+
+        for slug, snaps in slug_snaps.items():
+            if len(snaps) < min_snaps or slug not in market_map:
+                continue
+
+            prices  = [s["p"] for s in snaps]
+            market  = market_map[slug]
+
+            # calcula variações consecutivas
+            changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+            if not changes:
+                continue
+
+            # velocidade média e direção
+            avg_change = sum(changes) / len(changes)
+            abs_avg    = sum(abs(c) for c in changes) / len(changes)
+
+            # aceleração: segunda metade vs primeira metade
+            mid    = len(changes) // 2
+            v_old  = sum(abs(c) for c in changes[:mid]) / max(mid, 1)
+            v_new  = sum(abs(c) for c in changes[mid:]) / max(len(changes) - mid, 1)
+            accel  = v_new - v_old
+
+            # consistência: quantos movimentos vão na mesma direção?
+            neg = sum(1 for c in changes if c < -0.1)
+            pos = sum(1 for c in changes if c > 0.1)
+            consistency = max(neg, pos) / len(changes) if changes else 0
+
+            # regime
+            if avg_change < -0.3 and consistency > 0.6 and accel > 0:
+                regime = "PÂNICO"
+                cor    = "#ff453a"
+                oportunidade = "FADE — considere comprar YES (mercado exagerou para baixo)"
+                signal = "BUY"
+                intensidade = min(round(abs(avg_change) * consistency * 50, 1), 100)
+            elif avg_change > 0.3 and consistency > 0.6 and accel > 0:
+                regime = "EUFORIA"
+                cor    = "#ff9f0a"
+                oportunidade = "FADE — considere comprar NO (mercado exagerou para cima)"
+                signal = "SELL"
+                intensidade = min(round(avg_change * consistency * 50, 1), 100)
+            elif abs(avg_change) < 0.05 and abs_avg < 0.2:
+                regime = "ESTÁVEL"
+                cor    = "#30d158"
+                oportunidade = "Mercado em equilíbrio — sem sinal de regime irracional"
+                signal = "HOLD"
+                intensidade = 0
+            else:
+                regime = "MOVIMENTO"
+                cor    = "#0a84ff"
+                oportunidade = "Movimento moderado — monitorar"
+                signal = "WATCH"
+                intensidade = min(round(abs_avg * 30, 1), 50)
+
+            if regime in ("ESTÁVEL", "MOVIMENTO"):
+                continue
+
+            results.append({
+                "question":      market["question"],
+                "slug":          slug,
+                "yes_price":     market["yes_price"],
+                "no_price":      market["no_price"],
+                "regime":        regime,
+                "cor":           cor,
+                "intensidade":   intensidade,
+                "oportunidade":  oportunidade,
+                "signal":        signal,
+                "avg_change":    round(avg_change, 3),
+                "aceleracao":    round(accel, 3),
+                "consistencia":  round(consistency, 2),
+                "total_snaps":   len(snaps),
+                "volume_24h":    market.get("volume_24h", 0),
+                "days_to_close": market.get("days_to_close"),
+                "tier":          market.get("tier"),
+                "tier_label":    market.get("tier_label"),
+            })
+
+        results.sort(key=lambda x: x["intensidade"], reverse=True)
+        return results[:top]
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/velocity")
+def get_velocity(
+    min_snaps: int   = Query(default=6),
+    top:       int   = Query(default=20),
+):
+    """
+    Motor #37 — Velocidade de Movimento
+    Alta velocidade sem catalisador = spike manipulado → oportunidade de reversão.
+    Baixa velocidade + fundamento (mudança 24h real) = tendência real → seguir.
+    """
+    if not Session:
+        return {"error": "Banco nao conectado"}
+    try:
+        now     = datetime.now(timezone.utc)
+        session = Session()
+
+        rows = session.execute(text("""
+            SELECT slug, yes_price, captured_at
+            FROM snapshots
+            WHERE captured_at >= NOW() - INTERVAL '3 hours'
+            ORDER BY slug, captured_at ASC
+        """)).fetchall()
+        session.close()
+
+        from collections import defaultdict
+        slug_snaps = defaultdict(list)
+        for slug, yes_price, captured_at in rows:
+            slug_snaps[slug].append({"p": yes_price, "t": captured_at})
+
+        all_data   = fetch_all_markets()
+        market_map = {}
+        for m in all_data:
+            parsed = parse_market(m, now)
+            if parsed:
+                market_map[parsed["slug"]] = parsed
+
+        results = []
+
+        for slug, snaps in slug_snaps.items():
+            if len(snaps) < min_snaps or slug not in market_map:
+                continue
+
+            market  = market_map[slug]
+            prices  = [s["p"] for s in snaps]
+            times   = [s["t"] for s in snaps]
+
+            # velocidade = variação total / tempo em minutos
+            delta_price = abs(prices[-1] - prices[0])
+            try:
+                delta_min = (times[-1] - times[0]).total_seconds() / 60
+            except Exception:
+                delta_min = len(snaps)
+
+            if delta_min <= 0:
+                continue
+
+            velocity_per_min = delta_price / delta_min  # pp por minuto
+
+            # catalisador externo = mudança 24h do Polymarket
+            change_24h = market.get("change_24h") or 0
+            has_catalyst = abs(change_24h) > 0.03  # >3% mudança 24h = tem fundamento
+
+            # direção do movimento recente
+            direction = prices[-1] - prices[0]
+            signal    = "BUY" if direction < 0 else "SELL" if direction > 0 else "HOLD"
+
+            # classificação
+            if velocity_per_min > 0.5 and not has_catalyst:
+                tipo = "SPIKE MANIPULADO"
+                cor  = "#ff453a"
+                acao = f"Reversão provável — {'compre YES' if signal == 'BUY' else 'compre NO'} (spike sem fundamento)"
+            elif velocity_per_min > 0.3 and has_catalyst:
+                tipo = "TENDÊNCIA REAL"
+                cor  = "#30d158"
+                acao = f"Seguir movimento — {'compre YES' if direction > 0 else 'compre NO'} (com catalisador)"
+                signal = "BUY" if direction > 0 else "SELL"
+            elif velocity_per_min > 0.15:
+                tipo = "MOVIMENTO MODERADO"
+                cor  = "#ff9f0a"
+                acao = "Monitorar — velocidade significativa mas inconclusivo"
+            else:
+                continue
+
+            results.append({
+                "question":        market["question"],
+                "slug":            slug,
+                "yes_price":       market["yes_price"],
+                "no_price":        market["no_price"],
+                "tipo":            tipo,
+                "cor":             cor,
+                "acao":            acao,
+                "signal":          signal,
+                "velocity_per_min":round(velocity_per_min, 4),
+                "delta_price":     round(delta_price, 2),
+                "delta_min":       round(delta_min, 1),
+                "has_catalyst":    has_catalyst,
+                "change_24h_pct":  round(change_24h * 100, 2) if change_24h else 0,
+                "total_snaps":     len(snaps),
+                "volume_24h":      market.get("volume_24h", 0),
+                "days_to_close":   market.get("days_to_close"),
+                "tier":            market.get("tier"),
+                "tier_label":      market.get("tier_label"),
+            })
+
+        results.sort(key=lambda x: x["velocity_per_min"], reverse=True)
+        return results[:top]
+
+    except Exception as e:
+        return {"error": str(e)}    
+    
+    
