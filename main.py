@@ -18,7 +18,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///polysignal.db")
 engine = None
 Session = None
 Base = declarative_base()
@@ -37,12 +37,11 @@ class Snapshot(Base):
 
 if DATABASE_URL:
     try:
+        _is_sqlite = DATABASE_URL.startswith("sqlite")
         engine = create_engine(
-            DATABASE_URL.replace("postgres://", "postgresql://", 1),
-            pool_pre_ping=True,
-            pool_size=3,
-            max_overflow=0,
-            pool_recycle=300,
+            DATABASE_URL if _is_sqlite else DATABASE_URL.replace("postgres://", "postgresql://", 1),
+            connect_args={"check_same_thread": False} if _is_sqlite else {},
+            **({} if _is_sqlite else {"pool_pre_ping": True, "pool_size": 3, "max_overflow": 0, "pool_recycle": 300}),
         )
         Base.metadata.create_all(engine)
         Session = sessionmaker(bind=engine)
@@ -344,7 +343,7 @@ def worker_loop():
                     try:
                         session = Session()
                         rows = session.execute(text("""
-                            SELECT slug, AVG(yes_price), STDDEV(yes_price), AVG(volume_24h), STDDEV(volume_24h), COUNT(*)
+                            SELECT slug, AVG(yes_price), AVG(yes_price * yes_price) - AVG(yes_price) * AVG(yes_price), AVG(volume_24h), AVG(volume_24h * volume_24h) - AVG(volume_24h) * AVG(volume_24h), COUNT(*)
                             FROM snapshots GROUP BY slug HAVING COUNT(*) >= 5
                         """)).fetchall()
                         session.close()
@@ -565,7 +564,7 @@ def get_recommendations(
         all_data = fetch_all_markets()
         session  = Session()
         rows     = session.execute(text("""
-            SELECT slug, AVG(yes_price), STDDEV(yes_price), AVG(volume_24h), STDDEV(volume_24h), COUNT(*)
+            SELECT slug, AVG(yes_price), AVG(yes_price * yes_price) - AVG(yes_price) * AVG(yes_price), AVG(volume_24h), AVG(volume_24h * volume_24h) - AVG(volume_24h) * AVG(volume_24h), COUNT(*)
             FROM snapshots GROUP BY slug HAVING COUNT(*) >= 5
         """)).fetchall()
         session.close()
@@ -669,7 +668,7 @@ def get_anomalies(
         all_data = fetch_all_markets()
         session  = Session()
         rows     = session.execute(text("""
-            SELECT slug, AVG(yes_price), STDDEV(yes_price), AVG(volume_24h), STDDEV(volume_24h), COUNT(*), MAX(captured_at)
+            SELECT slug, AVG(yes_price), AVG(yes_price * yes_price) - AVG(yes_price) * AVG(yes_price), AVG(volume_24h), AVG(volume_24h * volume_24h) - AVG(volume_24h) * AVG(volume_24h), COUNT(*), MAX(captured_at)
             FROM snapshots GROUP BY slug HAVING COUNT(*) >= 10
         """)).fetchall()
         session.close()
@@ -1988,4 +1987,126 @@ def get_velocity(
     except Exception as e:
         return {"error": str(e)}    
     
-    
+# ═══════════════════════════════════════════════════════════════════════════════
+# PATCH — Adicionar no FINAL do main.py
+# Motor #7 — Correlação Cross-Market
+# Detecta mercados que se movem juntos e quebras de correlação
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/correlation")
+def get_correlation(
+    min_snaps: int = Query(default=10),
+    top:       int = Query(default=15),
+):
+    """
+    Motor #7 — Correlação Cross-Market
+    Calcula correlação de Pearson entre pares de mercados.
+    Quebra de correlação = oportunidade de arbitragem.
+    Alta correlação positiva = mercados andam juntos.
+    Alta correlação negativa = mercados andam em direções opostas.
+    """
+    if not Session:
+        return {"error": "Banco nao conectado"}
+    try:
+        session = Session()
+
+        # busca últimos snapshots por mercado
+        rows = session.execute(text("""
+            SELECT slug, question, yes_price, captured_at
+            FROM snapshots
+            WHERE captured_at >= datetime('now', '-12 hours')
+            ORDER BY slug, captured_at ASC
+        """)).fetchall()
+        session.close()
+
+        from collections import defaultdict
+        slug_data = defaultdict(lambda: {"prices": [], "question": ""})
+        for slug, question, yes_price, captured_at in rows:
+            slug_data[slug]["prices"].append(yes_price)
+            slug_data[slug]["question"] = question
+
+        # filtra slugs com snapshots suficientes
+        valid = {s: d for s, d in slug_data.items() if len(d["prices"]) >= min_snaps}
+
+        if len(valid) < 2:
+            return {"error": "Snapshots insuficientes — aguarde mais coletas", "total_mercados": len(valid)}
+
+        slugs = list(valid.keys())
+
+        def pearson(x, y):
+            n = min(len(x), len(y))
+            if n < 3:
+                return 0
+            x = x[-n:]; y = y[-n:]
+            mx = sum(x)/n; my = sum(y)/n
+            num = sum((x[i]-mx)*(y[i]-my) for i in range(n))
+            dx  = (sum((v-mx)**2 for v in x))**0.5
+            dy  = (sum((v-my)**2 for v in y))**0.5
+            if dx == 0 or dy == 0:
+                return 0
+            return round(num / (dx * dy), 3)
+
+        # calcula pares
+        pairs = []
+        for i in range(len(slugs)):
+            for j in range(i+1, len(slugs)):
+                s1 = slugs[i]; s2 = slugs[j]
+                p1 = valid[s1]["prices"]; p2 = valid[s2]["prices"]
+                corr = pearson(p1, p2)
+
+                if abs(corr) < 0.6:
+                    continue  # só correlações significativas
+
+                # mudança recente de cada mercado
+                chg1 = round(p1[-1] - p1[-min(5, len(p1))], 2)
+                chg2 = round(p2[-1] - p2[-min(5, len(p2))], 2)
+
+                # quebra de correlação = correlação positiva mas movimentos opostos
+                quebra = (corr > 0.6 and chg1 * chg2 < 0 and abs(chg1) > 0.5 and abs(chg2) > 0.5)
+                # divergência = correlação negativa mas movimentos iguais
+                divergencia = (corr < -0.6 and chg1 * chg2 > 0 and abs(chg1) > 0.5 and abs(chg2) > 0.5)
+
+                if corr >= 0.85:
+                    tipo = "MUITO ALTA"; cor = "#30d158"
+                elif corr >= 0.6:
+                    tipo = "ALTA"; cor = "#0a84ff"
+                elif corr <= -0.85:
+                    tipo = "INVERSA FORTE"; cor = "#ff453a"
+                else:
+                    tipo = "INVERSA"; cor = "#ff9f0a"
+
+                oportunidade = None
+                if quebra:
+                    oportunidade = f"QUEBRA DE CORRELAÇÃO — mercados correlacionados se movendo em direções opostas"
+                elif divergencia:
+                    oportunidade = f"DIVERGÊNCIA — mercados inversamente correlacionados convergindo"
+
+                pairs.append({
+                    "mercado_1":        valid[s1]["question"],
+                    "slug_1":           s1,
+                    "preco_atual_1":    round(p1[-1], 1),
+                    "mudanca_recente_1":chg1,
+                    "mercado_2":        valid[s2]["question"],
+                    "slug_2":           s2,
+                    "preco_atual_2":    round(p2[-1], 1),
+                    "mudanca_recente_2":chg2,
+                    "correlacao":       corr,
+                    "tipo":             tipo,
+                    "cor":              cor,
+                    "quebra_detectada": quebra or divergencia,
+                    "oportunidade":     oportunidade,
+                    "snaps_usados":     min(len(p1), len(p2)),
+                })
+
+        # ordena: quebras primeiro, depois por correlação absoluta
+        pairs.sort(key=lambda x: (-int(x["quebra_detectada"]), -abs(x["correlacao"])))
+        return {
+            "total_mercados_analisados": len(valid),
+            "total_pares":               len(pairs),
+            "quebras_detectadas":        sum(1 for p in pairs if p["quebra_detectada"]),
+            "pares":                     pairs[:top],
+        }
+
+    except Exception as e:
+        return {"error": str(e)}    
